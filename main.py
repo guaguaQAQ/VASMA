@@ -633,7 +633,7 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
         tip_logits = clip_logits + cache_logits * alpha
         acc = cls_acc(tip_logits, val_labels)
 
-        print("**** CaFo's val accuracy: {:.2f}. ****\n".format(acc))
+        print("**** VASMA's val accuracy: {:.2f}. ****\n".format(acc))
         if acc > best_acc:
             best_acc = acc
             best_epoch = train_idx
@@ -644,7 +644,7 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
     loaded_dino_w = torch.load(cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt", map_location=device)
     clip_adapter.weight = nn.Parameter(loaded_clip_w.to(clip_dtype).to(device))
     dino_adapter.weight = nn.Parameter(loaded_dino_w.to(clip_dtype).to(device))
-    print(f"**** After fine-tuning, CaFo's best val accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
+    print(f"**** After fine-tuning, VASMA's best val accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
 
     print("\n-------- Searching hyperparameters on the val set. --------")
 
@@ -668,7 +668,7 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
     cache_logits = logits_fuse(clip_logits, [clip_cache_logits, dino_cache_logits])
     tip_logits = clip_logits + cache_logits * best_alpha
     acc = cls_acc(tip_logits, test_labels)
-    print("**** CaFo's test accuracy: {:.2f}. ****\n".format(max(best_acc, acc)))
+    print("**** VASMA's test accuracy: {:.2f}. ****\n".format(max(best_acc, acc)))
   
     # ========== 导出预测结果用于后续分析 ==========
     save_dir = cfg['cache_dir']

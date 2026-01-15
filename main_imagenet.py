@@ -947,7 +947,7 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
         tip_logits = clip_logits + cache_logits * alpha
         acc = cls_acc(tip_logits, test_labels)
 
-        print("**** CaFo's test accuracy: {:.2f}. ****\n".format(acc))
+        print("**** VASMA's test accuracy: {:.2f}. ****\n".format(acc))
         if acc > best_acc:
             best_acc = acc
             best_epoch = train_idx
@@ -968,14 +968,14 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
         dino_adapter.weight = nn.Parameter(loaded_dino_w.to(clip_model.dtype).cuda())
         
         if cfg['train_epoch'] > 0:
-            print(f"**** After fine-tuning, CaFo's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
+            print(f"**** After fine-tuning, VASMA's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
         else:
             print(f"**** Loaded pre-trained adapters from cache (train_epoch=0). ****\n")
     else:
         if cfg['train_epoch'] == 0:
             print(f"⚠️  Warning: No pre-trained adapters found and train_epoch=0. Using initialized adapters.")
         else:
-            print(f"**** After fine-tuning, CaFo's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
+            print(f"**** After fine-tuning, VASMA's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
     
     # 清理训练过程中的变量（仅在训练过的情况下）
     if cfg['train_epoch'] > 0:
@@ -1052,6 +1052,7 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
         with open(metrics_file, 'w') as f:
             json.dump(metrics, f, indent=2)
         print(f"   Metrics saved to: {metrics_file}\n")
+
 
     # ================================================================================
     # 可选透明化审计功能 (默认注释，需要时取消注释启用)
