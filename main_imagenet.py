@@ -26,6 +26,7 @@ from torchvision.transforms.functional import to_pil_image
 from sklearn.decomposition import PCA
 from sklearn.manifold import LocallyLinearEmbedding
 import scipy.linalg as la
+from calibration_metrics import evaluate_with_calibration, compute_confidence_interval, print_calibration_table
 
 # VAE模块定义
 # 原始VAE模型，使用BatchNorm
@@ -953,16 +954,57 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
             torch.save(clip_adapter.weight, cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt")
             torch.save(dino_adapter.weight, cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt")
     
-    clip_adapter.weight = torch.load(cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt")
-    dino_adapter.weight = torch.load(cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt")
-    print(f"**** After fine-tuning, CaFo's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
-
-    del clip_logits, tip_logits, cache_logits, clip_cache_logits, dino_cache_logits, clip_affinity, dino_affinity 
+    # 加载最佳权重（如果存在）
+    clip_adapter_path = cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt"
+    dino_adapter_path = cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt"
+    
+    if os.path.exists(clip_adapter_path) and os.path.exists(dino_adapter_path):
+        # 加载权重并确保在正确的设备和数据类型上
+        loaded_clip_w = torch.load(clip_adapter_path, map_location='cuda')
+        loaded_dino_w = torch.load(dino_adapter_path, map_location='cuda')
+        
+        # 转换到正确的数据类型
+        clip_adapter.weight = nn.Parameter(loaded_clip_w.to(clip_model.dtype).cuda())
+        dino_adapter.weight = nn.Parameter(loaded_dino_w.to(clip_model.dtype).cuda())
+        
+        if cfg['train_epoch'] > 0:
+            print(f"**** After fine-tuning, CaFo's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
+        else:
+            print(f"**** Loaded pre-trained adapters from cache (train_epoch=0). ****\n")
+    else:
+        if cfg['train_epoch'] == 0:
+            print(f"⚠️  Warning: No pre-trained adapters found and train_epoch=0. Using initialized adapters.")
+        else:
+            print(f"**** After fine-tuning, CaFo's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
+    
+    # 清理训练过程中的变量（仅在训练过的情况下）
+    if cfg['train_epoch'] > 0:
+        del clip_logits, tip_logits, cache_logits, clip_cache_logits, dino_cache_logits, clip_affinity, dino_affinity
+    
+    # 清理 GPU 缓存，避免内存碎片
+    torch.cuda.empty_cache()
+    
+    # 确保适配器处于评估模式
+    clip_adapter.eval()
+    dino_adapter.eval()
+    if vae_adapter is not None:
+        vae_adapter.eval()
+    
     # Search Hyperparameters
-    # _ = search_hp(cfg, affinity, clip_cache_values, clip_test_features, test_labels, clip_weights, clip_adapter=adapter)
+    print("\n-------- Searching hyperparameters on the test set. --------")
     best_beta, best_alpha = search_ensemble_hp(cfg, clip_cache_keys, clip_cache_values, clip_test_features, dino_cache_keys, dino_cache_values, dino_test_features, test_labels, clip_weights, clip_adapter=clip_adapter, dino_adapter=dino_adapter)
+    
+    # 确保所有张量的数据类型与适配器一致
+    target_dtype = clip_adapter.weight.dtype
+    clip_test_features = clip_test_features.to(target_dtype)
+    dino_test_features = dino_test_features.to(target_dtype)
+    clip_weights = clip_weights.to(target_dtype)
+    clip_cache_values = clip_cache_values.to(target_dtype)
+    dino_cache_values = dino_cache_values.to(target_dtype)
+    
+    # 计算最终的 logits
     clip_affinity = clip_adapter(clip_test_features)
-    dino_affinity = dino_adapter(dino_test_features).to(dino_cache_values.dtype)
+    dino_affinity = dino_adapter(dino_test_features)
     clip_cache_logits = ((-1) * (best_beta - best_beta * clip_affinity)).exp() @ clip_cache_values
     dino_cache_logits = ((-1) * (best_beta - best_beta * dino_affinity)).exp() @ dino_cache_values
     clip_logits = 100. * clip_test_features @ clip_weights
@@ -972,6 +1014,7 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
     
     # 如果提供了VAE适配器和缓存值，也添加到最终评估中
     if vae_adapter is not None and vae_cache_values is not None:
+        vae_cache_values = vae_cache_values.to(target_dtype)
         vae_affinity = vae_adapter(clip_test_features)  # 使用专用的VAE适配器
         vae_cache_logits = ((-1) * (best_beta - best_beta * vae_affinity)).exp() @ vae_cache_values
         cache_logits_list.append(vae_cache_logits)
@@ -980,6 +1023,141 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
     tip_logits = clip_logits + cache_logits * best_alpha
     print("save logits!!!!!!!!!!!!!")
     torch.save(tip_logits, cfg['cache_dir'] + "/best_tip_dino_dalle_logits_" + str(cfg['shots']) + "shots.pt")
+    
+    # ===== 新增：校准评估 =====
+    if cfg.get('compute_calibration', False):
+        print("\n" + "="*60)
+        print("Computing Calibration Metrics (ECE, NLL, Reliability Diagram)")
+        print("="*60)
+        
+        calib_dir = os.path.join(cfg['cache_dir'], 'calibration_results')
+        os.makedirs(calib_dir, exist_ok=True)
+        
+        # 评估校准指标
+        metrics = evaluate_with_calibration(
+            tip_logits, 
+            test_labels,
+            save_dir=calib_dir,
+            prefix=f"ImageNet_{cfg['shots']}shot"
+        )
+        
+        print(f"\n📊 Calibration Metrics for {cfg['shots']}-shot:")
+        print(f"   Top-1 Accuracy: {metrics['Top1']:.2f}%")
+        print(f"   ECE: {metrics['ECE']:.4f}")
+        print(f"   NLL: {metrics['NLL']:.4f}")
+        print(f"   Reliability diagram saved to: {calib_dir}")
+        
+        # 保存指标到文件
+        metrics_file = os.path.join(calib_dir, f"metrics_{cfg['shots']}shot.json")
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"   Metrics saved to: {metrics_file}\n")
+
+    # ================================================================================
+    # 可选透明化审计功能 (默认注释，需要时取消注释启用)
+    # 该功能实现了论文中提到的透明化审计：定量分解和视觉验证
+    # ================================================================================
+    """
+    # ============ 透明化审计：证据溯源分析 =============
+    print("\n" + "="*80)
+    print("🔍 TRANSPARENT AUDIT: Evidence Provenance Analysis")
+    print("="*80)
+
+    audit_enabled = cfg.get('enable_audit', False)
+    if audit_enabled:
+        print("✅ 透明化审计已启用，开始分析证据溯源...")
+
+        # 计算各个缓存来源的贡献度
+        clip_cache_contribution = clip_cache_logits * best_alpha
+        dino_cache_contribution = dino_cache_logits * best_alpha
+
+        # 如果有VAE贡献，也计算在内
+        vae_contribution = 0
+        if 'vae_cache_logits' in locals():
+            vae_contribution = vae_cache_logits * best_alpha
+
+        # 计算每个样本的来源贡献占比
+        total_cache_contribution = clip_cache_contribution + dino_cache_contribution
+        if vae_contribution != 0:
+            total_cache_contribution += vae_contribution
+
+        clip_proportion = torch.abs(clip_cache_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
+        dino_proportion = torch.abs(dino_cache_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
+
+        # 统计分析
+        print(f"\n📊 缓存来源贡献统计 ({len(test_labels)} 个测试样本):")
+        print(f"   CLIP缓存平均贡献比例: {clip_proportion.mean().item():.3f}")
+        print(f"   DINO缓存平均贡献比例: {dino_proportion.mean().item():.3f}")
+        if vae_contribution != 0:
+            vae_proportion = torch.abs(vae_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
+            print(f"   VAE缓存平均贡献比例: {vae_proportion.mean().item():.3f}")
+        print(f"   零-shot CLIP贡献占比: {(torch.abs(clip_logits) / (torch.abs(tip_logits) + 1e-8)).mean().item():.3f}")
+
+        # 分析高置信度预测的来源分布
+        confidence_threshold = 0.8
+        top_predictions = torch.softmax(tip_logits, dim=1).max(dim=1)[0] > confidence_threshold
+        if top_predictions.sum() > 0:
+            high_conf_clip_prop = clip_proportion[top_predictions].mean().item()
+            high_conf_dino_prop = dino_proportion[top_predictions].mean().item()
+            print(f"\n🎯 高置信度预测 ({top_predictions.sum().item()}/{len(test_labels)} 个样本):")
+            print(f"   CLIP缓存贡献: {high_conf_clip_prop:.3f}")
+            print(f"   DINO缓存贡献: {high_conf_dino_prop:.3f}")
+            if vae_contribution != 0:
+                high_conf_vae_prop = vae_proportion[top_predictions].mean().item()
+                print(f"   VAE缓存贡献: {high_conf_vae_prop:.3f}")
+
+        # 分析Top-1预测的证据强度分布
+        predictions = tip_logits.argmax(dim=1)
+        correct_predictions = (predictions == test_labels).sum().item()
+        accuracy = correct_predictions / len(test_labels)
+
+        print(f"\n🎯 预测准确性分析:")
+        print(f"   Top-1准确率: {accuracy:.3f} ({correct_predictions}/{len(test_labels)})")
+        print(f"   平均预测置信度: {torch.softmax(tip_logits, dim=1).max(dim=1)[0].mean().item():.3f}")
+
+        # 保存审计结果
+        audit_save_path = os.path.join(cfg['cache_dir'], f"audit_results_{cfg['shots']}shots.json")
+        audit_results = {
+            "dataset": cfg.get('dataset', 'ImageNet'),
+            "shots": cfg['shots'],
+            "total_samples": len(test_labels),
+            "accuracy": accuracy,
+            "cache_contribution_stats": {
+                "clip_cache_avg_proportion": clip_proportion.mean().item(),
+                "dino_cache_avg_proportion": dino_proportion.mean().item(),
+                "zero_shot_clip_proportion": (torch.abs(clip_logits) / (torch.abs(tip_logits) + 1e-8)).mean().item()
+            },
+            "high_confidence_analysis": {
+                "threshold": confidence_threshold,
+                "high_conf_samples": top_predictions.sum().item(),
+                "high_conf_clip_proportion": high_conf_clip_prop if 'high_conf_clip_prop' in locals() else None,
+                "high_conf_dino_proportion": high_conf_dino_prop if 'high_conf_dino_prop' in locals() else None
+            }
+        }
+
+        # 如果有VAE，添加VAE统计
+        if vae_contribution != 0:
+            audit_results["cache_contribution_stats"]["vae_cache_avg_proportion"] = vae_proportion.mean().item()
+            if 'high_conf_vae_prop' in locals():
+                audit_results["high_confidence_analysis"]["high_conf_vae_proportion"] = high_conf_vae_prop
+
+        with open(audit_save_path, 'w') as f:
+            json.dump(audit_results, f, indent=2)
+        print(f"💾 审计结果已保存到: {audit_save_path}")
+
+        print("\n🔍 透明化审计完成！")
+        print("   - 可以查看各预测的证据来源分解")
+        print("   - 分析缓存贡献的统计分布")
+        print("   - 识别高置信度预测的决策模式")
+        print("   - 评估VAE等新增组件的贡献")
+
+    else:
+        print("ℹ️  透明化审计已禁用。如需启用，请在配置文件中设置: enable_audit: true")
+
+    print("="*80)
+    """
+
+    return tip_logits, test_labels
 
 def main():
 
@@ -1012,7 +1190,7 @@ def main():
     torch.manual_seed(1)
     
     print("Preparing ImageNet dataset.")
-    imagenet = ImageNet(cfg['root_path'], cfg['shots'], preprocess)
+    imagenet = ImageNet(cfg['root_path'], cfg['shots'])
 
     test_loader = torch.utils.data.DataLoader(imagenet.test, batch_size=64, num_workers=8, shuffle=False)
 
@@ -1022,8 +1200,8 @@ def main():
         train_loader_cache = None
         train_loader_F = None
     else:
-        train_loader_cache = torch.utils.data.DataLoader(imagenet.train, batch_size=256, num_workers=8, shuffle=False)
-        train_loader_F = torch.utils.data.DataLoader(imagenet.train, batch_size=256, num_workers=8, shuffle=True)
+        train_loader_cache = torch.utils.data.DataLoader(imagenet.train_x, batch_size=256, num_workers=8, shuffle=False)
+        train_loader_F = torch.utils.data.DataLoader(imagenet.train_x, batch_size=256, num_workers=8, shuffle=True)
 
     dalle_dataset = build_dataset(cfg['dalle_dataset'], cfg['root_path'], cfg['dalle_shots'])
     train_tranform = transforms.Compose([
@@ -1066,17 +1244,58 @@ def main():
         print("未获取到DALL-E特征，将仅使用文本特征进行流形学习")
     
     # 训练增强版VAE模型 - 编码器、生成器和流形投影器
-    netE, netG, manifold_projector = train_vae(
-        cfg, clip_model, gpt3_prompt, imagenet.classnames, imagenet.template, 
-        dalle_features_tensor, train_loader_cache
-    )
+    # 检查是否需要重新训练VAE
+    vae_encoder_path = cfg['cache_dir'] + "/best_vae_encoder_" + str(cfg['shots']) + "shots.pt"
+    vae_generator_path = cfg['cache_dir'] + "/best_vae_generator_" + str(cfg['shots']) + "shots.pt"
+    
+    if cfg.get('retrain_vae', True) or not (os.path.exists(vae_encoder_path) and os.path.exists(vae_generator_path)):
+        # 需要训练VAE
+        netE, netG, manifold_projector = train_vae(
+            cfg, clip_model, gpt3_prompt, imagenet.classnames, imagenet.template, 
+            dalle_features_tensor, train_loader_cache
+        )
+    else:
+        # 加载已有的VAE模型
+        print(f"\n加载已有的VAE模型 (retrain_vae=False)...")
+        netE = Encoder().cuda()
+        netG = Generator().cuda()
+        
+        netE.load_state_dict(torch.load(vae_encoder_path))
+        netG.load_state_dict(torch.load(vae_generator_path))
+        
+        netE.eval()
+        netG.eval()
+        
+        # 创建流形投影器（即使不训练也需要用于生成）
+        manifold_projector = ManifoldProjector(
+            manifold_dim=cfg.get('manifold_dim', 64),
+            n_neighbors=cfg.get('n_neighbors', 20)
+        )
+        
+        print("VAE模型加载完成。")
     
     # 使用增强版VAE生成特征
-    vae_features, vae_labels = generate_vae_features(cfg, netE, netG, clip_model, gpt3_prompt, 
-                                                   imagenet.classnames, imagenet.template, 
-                                                   manifold_projector, 
-                                                   n_samples=cfg.get('vae_samples', 10),
-                                                   use_manifold_noise=cfg.get('use_manifold_noise', True))
+    # 检查是否需要重新生成VAE特征
+    vae_features_path = cfg['cache_dir'] + "/vae_clip_features_" + str(cfg['shots']) + "shots.pt"
+    vae_labels_path = cfg['cache_dir'] + "/vae_clip_labels_" + str(cfg['shots']) + "shots.pt"
+    
+    if cfg.get('regenerate_vae', True) or not (os.path.exists(vae_features_path) and os.path.exists(vae_labels_path)):
+        # 需要生成VAE特征
+        vae_features, vae_labels = generate_vae_features(cfg, netE, netG, clip_model, gpt3_prompt, 
+                                                       imagenet.classnames, imagenet.template, 
+                                                       manifold_projector, 
+                                                       n_samples=cfg.get('vae_samples', 10),
+                                                       use_manifold_noise=cfg.get('use_manifold_noise', True))
+        
+        # 保存生成的特征
+        torch.save(vae_features, vae_features_path)
+        torch.save(vae_labels, vae_labels_path)
+    else:
+        # 加载已有的VAE特征
+        print(f"\n加载已有的VAE特征 (regenerate_vae=False)...")
+        vae_features = torch.load(vae_features_path)
+        vae_labels = torch.load(vae_labels_path)
+        print(f"加载了 {len(vae_features)} 个VAE特征。")
     
     # 构建VAE缓存模型
     vae_cache_keys, vae_cache_values = build_vae_cache_model(cfg, clip_model, vae_features, vae_labels)

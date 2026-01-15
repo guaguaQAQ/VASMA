@@ -640,8 +640,10 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
             torch.save(clip_adapter.weight, cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt")
             torch.save(dino_adapter.weight, cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt")
     
-    clip_adapter.weight = torch.load(cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt")
-    dino_adapter.weight = torch.load(cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt")
+    loaded_clip_w = torch.load(cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt", map_location=device)
+    loaded_dino_w = torch.load(cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt", map_location=device)
+    clip_adapter.weight = nn.Parameter(loaded_clip_w.to(clip_dtype).to(device))
+    dino_adapter.weight = nn.Parameter(loaded_dino_w.to(clip_dtype).to(device))
     print(f"**** After fine-tuning, CaFo's best val accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
 
     print("\n-------- Searching hyperparameters on the val set. --------")
@@ -667,6 +669,116 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
     tip_logits = clip_logits + cache_logits * best_alpha
     acc = cls_acc(tip_logits, test_labels)
     print("**** CaFo's test accuracy: {:.2f}. ****\n".format(max(best_acc, acc)))
+  
+    # ========== 导出预测结果用于后续分析 ==========
+    save_dir = cfg['cache_dir']
+    os.makedirs(save_dir, exist_ok=True)
+  
+    # 保存 labels（所有方法共用）
+    labels_path = os.path.join(save_dir, f"test_labels_{cfg['shots']}shots.npy")
+    np.save(labels_path, test_labels.cpu().numpy())
+    print(f"已保存 labels 到: {labels_path}")
+  
+    # 1. Unified方法（最终融合的 tip_logits，使用搜索得到的 best_alpha/beta）
+    unified_logits_path = os.path.join(save_dir, f"test_logits_unified_{cfg['shots']}shots.npy")
+    np.save(unified_logits_path, tip_logits.detach().cpu().numpy())
+    print(f"已保存 Unified logits 到: {unified_logits_path}")
+  
+    # 2. ClipCache方法（仅CLIP cache）
+    clip_cache_logits_path = os.path.join(save_dir, f"test_logits_clip_{cfg['shots']}shots.npy")
+    np.save(clip_cache_logits_path, clip_cache_logits.detach().cpu().numpy())
+    print(f"已保存 ClipCache logits 到: {clip_cache_logits_path}")
+  
+    # 3. ClipDino方法（朴素融合，固定权重 alpha=0.5，无超参搜索）
+    # 这是一个更弱的 baseline，用于对比 Unified 的超参搜索优势
+    naive_alpha = 0.5
+    clipdino_logits_path = os.path.join(save_dir, f"test_logits_clipdino_{cfg['shots']}shots.npy")
+    np.save(clipdino_logits_path, (clip_logits + cache_logits * naive_alpha).detach().cpu().numpy())
+    print(f"已保存 ClipDino logits (naive fusion, alpha={naive_alpha}) 到: {clipdino_logits_path}")
+  
+    print(f"\n所有预测结果已保存到: {save_dir}")
+
+    # ================================================================================
+    # 可选透明化审计功能 (默认注释，需要时取消注释启用)
+    # 该功能实现了论文中提到的透明化审计：定量分解和视觉验证
+    # ================================================================================
+    """
+    # ============ 透明化审计：证据溯源分析 =============
+    print("\n" + "="*80)
+    print("🔍 TRANSPARENT AUDIT: Evidence Provenance Analysis")
+    print("="*80)
+
+    audit_enabled = cfg.get('enable_audit', False)
+    if audit_enabled:
+        print("✅ 透明化审计已启用，开始分析证据溯源...")
+
+        # 计算各个缓存来源的贡献度
+        clip_cache_contribution = clip_cache_logits * best_alpha
+        dino_cache_contribution = dino_cache_logits * best_alpha
+
+        # 计算每个样本的来源贡献占比
+        total_cache_contribution = clip_cache_contribution + dino_cache_contribution
+        clip_proportion = torch.abs(clip_cache_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
+        dino_proportion = torch.abs(dino_cache_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
+
+        # 统计分析
+        print(f"\n📊 缓存来源贡献统计 ({len(test_labels)} 个测试样本):")
+        print(f"   CLIP缓存平均贡献比例: {clip_proportion.mean().item():.3f}")
+        print(f"   DINO缓存平均贡献比例: {dino_proportion.mean().item():.3f}")
+        print(f"   零-shot CLIP贡献占比: {(torch.abs(clip_logits) / (torch.abs(tip_logits) + 1e-8)).mean().item():.3f}")
+
+        # 分析高置信度预测的来源分布
+        confidence_threshold = 0.8
+        top_predictions = torch.softmax(tip_logits, dim=1).max(dim=1)[0] > confidence_threshold
+        if top_predictions.sum() > 0:
+            high_conf_clip_prop = clip_proportion[top_predictions].mean().item()
+            high_conf_dino_prop = dino_proportion[top_predictions].mean().item()
+            print(f"\n🎯 高置信度预测 ({top_predictions.sum().item()}/{len(test_labels)} 个样本):")
+            print(f"   CLIP缓存贡献: {high_conf_clip_prop:.3f}")
+            print(f"   DINO缓存贡献: {high_conf_dino_prop:.3f}")
+
+        # 保存审计结果（可选）
+        audit_save_path = os.path.join(save_dir, f"audit_results_{cfg['shots']}shots.json")
+        audit_results = {
+            "dataset": cfg['dataset'],
+            "shots": cfg['shots'],
+            "total_samples": len(test_labels),
+            "cache_contribution_stats": {
+                "clip_cache_avg_proportion": clip_proportion.mean().item(),
+                "dino_cache_avg_proportion": dino_proportion.mean().item(),
+                "zero_shot_clip_proportion": (torch.abs(clip_logits) / (torch.abs(tip_logits) + 1e-8)).mean().item()
+            },
+            "high_confidence_analysis": {
+                "threshold": confidence_threshold,
+                "high_conf_samples": top_predictions.sum().item(),
+                "high_conf_clip_proportion": high_conf_clip_prop if 'high_conf_clip_prop' in locals() else None,
+                "high_conf_dino_proportion": high_conf_dino_prop if 'high_conf_dino_prop' in locals() else None
+            }
+        }
+
+        import json
+        with open(audit_save_path, 'w') as f:
+            json.dump(audit_results, f, indent=2)
+        print(f"💾 审计结果已保存到: {audit_save_path}")
+
+        print("\n🔍 透明化审计完成！")
+        print("   - 可以查看各预测的证据来源分解")
+        print("   - 分析缓存贡献的统计分布")
+        print("   - 识别高置信度预测的决策模式")
+
+    else:
+        print("ℹ️  透明化审计已禁用。如需启用，请在配置文件中设置: enable_audit: true")
+
+    print("="*80)
+    """
+
+
+
+
+
+
+
+
 
 def main():
 
