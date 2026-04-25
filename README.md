@@ -1,6 +1,6 @@
-# VASMA: Manifold-Guided Dual-Domain Augmentation with Unified Cache Fusion
+# Knowledge-Driven Geometric Rectification and Evidential Cache System for Few-Shot Recognition
 
-Official implementation of ['VASMA: Manifold-Guided Dual-Domain Augmentation with Unified Cache Fusion for Zero-/Few-Shot Recognition'](https://arxiv.org/abs/).
+Official implementation of ['Knowledge-Driven Geometric Rectification and Evidential Cache System for Few-Shot Recognition'].
 
 The paper has been submitted to **Knowledge-Based Systems**.
 
