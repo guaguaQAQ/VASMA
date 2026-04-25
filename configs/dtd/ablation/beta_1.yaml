@@ -1,0 +1,71 @@
+# ===================================================================
+# CaFo消融实验 - DTD 16-shot
+# 实验A3: β=0.1 (强条件先验)
+# ===================================================================
+
+# ------ 基础数据集配置 ------
+dataset: 'dtd'
+root_path: 'datasets'
+shots: 16
+
+# ------ 模型骨干网络 ------
+clip_backbone: 'RN50'
+dino_backbone: 'resnet50'
+
+# ------ DALL-E数据集配置 ------
+dalle_dataset: 'dalle_dtd'
+dalle_shots: 1
+
+# ------ 缓存和特征加载 ------
+load_cache: False
+load_pre_feat: False
+
+# ------ 训练配置 ------
+lr: 0.001
+train_epoch: 20
+augment_epoch: 10
+
+# ------ 超参数搜索 ------
+search_hp: True
+search_scale: [13, 13]
+search_step: [200, 20]
+init_beta: 1
+init_alpha: 2
+
+# ------ GPT提示词文件 ------
+gpt3_prompt_file: './gpt_file/dtd_prompt.json'
+
+# ------ VAE模型配置 ------
+retrain_vae: True
+regenerate_vae: True
+vae_lr: 0.001
+vae_epochs: 100
+vae_samples: 10
+
+# ------ 流形学习配置 ------
+manifold_dim: 64
+n_neighbors: 20
+manifold_samples: 800
+real_image_samples: 1200
+
+# ------ 噪声投影配置 ------
+use_manifold_noise: true
+manifold_noise_scale: 0.08
+feature_blend_factor: 0.85
+
+# ------ 优化配置 ------
+use_adaptive_fusion: true
+use_cosine_loss: true
+use_feature_augmentation: true
+early_stop_patience: 30
+
+# ===================================================================
+# 生成特征紧密对齐语义锚点方向
+# ===================================================================
+use_conditional_prior: True
+prior_sigma: 0.1
+prior_beta: 1
+
+# ------ 实验标识 ------
+ablation_experiment: 'beta_1'
+ablation_description: '强KL正则化 (β=1), 紧密对齐语义锚点'

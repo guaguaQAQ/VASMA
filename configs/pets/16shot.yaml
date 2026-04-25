@@ -1,0 +1,66 @@
+# ===================================================================
+# CaFo配置文件 - Oxford Pets 16-shot
+# 包含CLIP+DINO双模态融合及流形投影VAE增强
+# ===================================================================
+
+# ------ 基础数据集配置 ------
+dataset: 'oxford_pets'
+root_path: 'datasets'
+shots: 16
+
+# ------ 模型骨干网络 ------
+clip_backbone: 'RN50'  # 可选: ['RN50', 'RN101', 'RN50x4', 'RN50x16', 'ViT-B/32', 'ViT-B/16']
+dino_backbone: 'resnet50'
+
+# ------ DALL-E数据集配置 ------
+dalle_dataset: 'dalle_pets'
+dalle_shots: 8
+
+# ------ 缓存和特征加载 ------
+load_cache: True
+load_pre_feat: True
+
+# ------ 训练配置 ------
+lr: 0.001
+train_epoch: 0
+augment_epoch: 10
+
+# ------ 超参数搜索 ------
+search_hp: True
+search_scale: [7, 3]
+search_step: [200, 20]
+init_beta: 1
+init_alpha: 1.5
+
+# ------ GPT提示词文件 ------
+gpt3_prompt_file: './gpt_file/oxford_pets_prompt.json'
+
+# ------ VAE模型配置 ------
+retrain_vae: False        # 是否重新训练VAE模型
+regenerate_vae: False     # 是否重新生成VAE特征
+vae_lr: 0.001            # VAE训练学习率
+vae_epochs: 100          # VAE训练轮数
+vae_samples: 10          # 每个类别生成的VAE样本数
+
+# ------ 流形学习配置 ------
+manifold_dim: 64                # 流形切空间维度（建议32-128）
+n_neighbors: 20                 # 局部邻居数量
+manifold_samples: 800           # 用于流形学习的DALL-E样本数量
+real_image_samples: 1200        # 用于流形学习的真实图片样本数量
+
+# ------ 噪声投影配置 ------
+use_manifold_noise: true        # 启用流形结构化噪声
+manifold_noise_scale: 0.08      # 流形噪声缩放因子
+feature_blend_factor: 0.85      # 特征混合比例（噪声与原特征）
+
+# ------ 优化配置 ------
+use_adaptive_fusion: true       # 启用自适应特征融合
+use_cosine_loss: true           # 使用余弦相似度损失
+use_feature_augmentation: true  # 启用特征空间数据增强
+early_stop_patience: 30         # 早停耐心值
+
+# ------ 调试选项 ------
+# 取消下面的注释以启用调试模式
+# load_cache: True
+# load_pre_feat: True
+# search_hp: False

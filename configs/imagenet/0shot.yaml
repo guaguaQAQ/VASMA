@@ -1,0 +1,41 @@
+# ===================================================================
+# CaFo配置文件 - ImageNet 纯零样本 (不使用DALL-E和VAE)
+# 用于公平对比真正的零样本性能
+# ===================================================================
+
+# ------ 基础数据集配置 ------
+dataset: 'ImageNet'
+root_path: 'datasets'
+shots: 0                     # 真实样本：0-shot
+
+# ------ 模型骨干网络 ------
+clip_backbone: 'RN50'
+dino_backbone: 'resnet50'
+
+# ------ DALL-E数据集配置 ------
+dalle_dataset: 'dalle_imagenet'
+dalle_shots: 0              # ★★★ 关键：设置为0，不使用任何DALL-E数据 ★★★
+
+# ------ VAE配置 ------
+use_vae: false             # ★★★ 关键：禁用VAE ★★★
+retrain_vae: False
+regenerate_vae: False
+
+# ------ 缓存和特征加载 ------
+load_cache: False
+load_pre_feat: False
+
+# ------ 训练配置 ------
+lr: 0.001
+train_epoch: 0
+augment_epoch: 0
+
+# ------ 超参数搜索 ------
+search_hp: True
+search_scale: [7, 3]
+search_step: [200, 20]
+init_beta: 1
+init_alpha: 0.6
+
+# ------ GPT提示词文件 ------
+gpt3_prompt_file: './gpt_file/imagenet_prompt.json'

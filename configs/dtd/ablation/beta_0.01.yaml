@@ -1,0 +1,73 @@
+# ===================================================================
+# CaFo消融实验 - DTD 16-shot
+# 实验A2: β=0.01 (弱条件先验)
+# ===================================================================
+
+# ------ 基础数据集配置 ------
+dataset: 'dtd'
+root_path: 'datasets'
+shots: 1
+
+# ------ 模型骨干网络 ------
+clip_backbone: 'RN50'
+dino_backbone: 'resnet50'
+
+# ------ DALL-E数据集配置 ------
+dalle_dataset: 'dalle_dtd'
+dalle_shots: 1
+
+# ------ 缓存和特征加载 ------
+load_cache: True
+load_pre_feat: True
+
+# ------ 训练配置 ------
+lr: 0.001
+train_epoch: 20
+augment_epoch: 10
+
+# ------ 超参数搜索 ------
+search_hp: True
+search_scale: [13, 13]
+search_step: [200, 20]
+init_beta: 1
+init_alpha: 2
+
+# ------ GPT提示词文件 ------
+gpt3_prompt_file: './gpt_file/dtd_prompt.json'
+
+# ------ VAE模型配置 ------
+retrain_vae: False
+regenerate_vae: False
+vae_lr: 0.001
+vae_epochs: 100
+vae_samples: 10
+
+# ------ 流形学习配置 ------
+manifold_dim: 64
+n_neighbors: 20
+manifold_samples: 800
+real_image_samples: 1200
+
+# ------ 噪声投影配置 ------
+use_manifold_noise: true
+manifold_noise_scale: 0.08
+feature_blend_factor: 0.85
+
+# ------ 优化配置 ------
+use_adaptive_fusion: true
+use_cosine_loss: true
+use_feature_augmentation: true
+early_stop_patience: 30
+
+# ===================================================================
+# 消融实验A: β=0.01 (弱条件先验)
+# prior_beta=0.01 表示弱KL散度权重
+# 允许生成特征轻微偏离语义锚点，但仍有结构化信息
+# ===================================================================
+use_conditional_prior: True      # 使用条件VAE结构
+prior_sigma: 0.1                  # 先验标准差
+prior_beta: 0.01                 # KL散度权重设为0.01，弱先验约束
+
+# ------ 实验标识 ------
+ablation_experiment: 'beta_0.01'
+ablation_description: '弱KL正则化 (β=0.01), 轻微偏离语义锚点'
