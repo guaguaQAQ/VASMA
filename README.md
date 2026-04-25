@@ -2,14 +2,14 @@
 
 Official implementation of ['VASMA: Manifold-Guided Dual-Domain Augmentation with Unified Cache Fusion for Zero-/Few-Shot Recognition'](https://arxiv.org/abs/).
 
-The paper has been submitted to **Information Fusion** 📝.
+The paper has been submitted to **Knowledge-Based Systems**.
 
 ## News
-* The code of VASMA has been released.
-* VASMA achieves state-of-the-art results on 11 diverse benchmarks, improving over zero-shot CLIP by an average of +24.6 percentage points (+41.8% relative improvement).
+- The code of VASMA has been released.
+- VASMA achieves state-of-the-art results on 11 diverse benchmarks, improving over zero-shot CLIP by an average of +24.6 percentage points (+41.8% relative improvement).
 
 ## Introduction
-We propose **VASMA** (Variational Augmentation with Semantic Manifold Anchoring), a unified information-fusion framework that bridges the modality gap through **manifold-guided geometry**. VASMA treats textual prototypes as **shared semantic anchors** that guide the generation and integration of multi-source evidence. 
+We propose **VASMA** (Variational Augmentation with Semantic Manifold Anchoring), a unified information-fusion framework that bridges the modality gap through **manifold-guided geometry**. VASMA treats textual prototypes as **shared semantic anchors** that guide the generation and integration of multi-source evidence.
 
 Specifically, VASMA works by **`Semantic Anchoring, Dual-Domain Augmentation, then Unified Cache Fusion'**:
 - **Semantic Anchoring**: We leverage GPT-3 to expand class names into rich textual descriptions, forming robust semantic prototypes that serve as anchors for all subsequent processes.
@@ -49,22 +49,22 @@ Please follow [DATASET.md](https://github.com/gaopengcuhk/Tip-Adapter/blob/main/
 - Cross-domain tasks: EuroSAT, UCF101, Caltech101
 
 ### Foundation Models
-* The pre-trained weights of **CLIP** (ResNet-50) will be automatically downloaded by running.
-* The prompts produced by **GPT-3** have been stored at `gpt_file/`.
-* Please download **DINO's** pre-trained ResNet-50 from [here](https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth), and put it under `dino/`.
-* Please download **DALL-E 2's** generated images from [here](https://drive.google.com/drive/folders/[your-folder-id]), and organize them with the official datasets like:
+- The pre-trained weights of **CLIP** (ResNet-50) will be automatically downloaded by running.
+- The prompts produced by **GPT-3** have been stored at `gpt_file/`.
+- Please download **DINO's** pre-trained ResNet-50 from [here](https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth), and put it under `dino/`.
+- Please download **DALL-E 2's** generated images from [here](https://drive.google.com/drive/folders/[your-folder-id]), and organize them with the official datasets like:
 ```
 $DATA/
-|–– imagenet/
-|–– caltech-101/
-|–– oxford_pets/
-|–– ...
-|–– dalle_imagenet/
-|–– dalle_caltech-101/
-|–– dalle_oxford_pets/
-|–– ...
+|-- imagenet/
+|-- caltech-101/
+|-- oxford_pets/
+|-- ...
+|-- dalle_imagenet/
+|-- dalle_caltech-101/
+|-- dalle_oxford_pets/
+|-- ...
 ```
-* The **Conditional VAE** for feature generation will be trained during the first run and saved for later use.
+- The **Conditional VAE** for feature generation will be trained during the first run and saved for later use.
 
 ## Get Started
 ### Configs
@@ -90,7 +90,7 @@ CUDA_VISIBLE_DEVICES=0 python main.py --config configs/[dataset]/0shot.yaml
 ### Numerical Results
 
 We provide VASMA's numerical results on 11 datasets from 0 to 16 shots. VASMA achieves:
-- **Zero-shot**: 61.87% on ImageNet (+1.15 points over CaFo)
+- **Zero-shot**: 62.89% on ImageNet (+2.17 points over CaFo)
 - **1-shot**: 64.04% on ImageNet (+0.24 points over CaFo)
 - **16-shot**: 69.28% on ImageNet (+0.49 points over CaFo)
 
@@ -99,14 +99,13 @@ Detailed results can be found in the paper and will be updated in the repository
 ## Acknowledgement
 This repo benefits from [Tip-Adapter](https://github.com/gaopengcuhk/Tip-Adapter), [CaFo](https://github.com/ZrrSkywalker/CaFo), [CLIP](https://github.com/openai/CLIP), [DINO](https://github.com/facebookresearch/dino), [DALL-E](https://github.com/borisdayma/dalle-mini) and related works. Thanks for their wonderful contributions.
 
-
 ## Citation
 ```bibtex
-@article{vasma2024,
+@article{vasma2026,
   title={VASMA: Manifold-Guided Dual-Domain Augmentation with Unified Cache Fusion for Zero-/Few-Shot Recognition},
   author={Anonymous},
-  journal={Information Fusion},
-  year={2024}
+  journal={Knowledge-Based Systems},
+  year={2026}
 }
 ```
 
