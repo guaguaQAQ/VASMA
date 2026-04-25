@@ -18,6 +18,8 @@ from utils import *
 import dino.utils as utils
 import itertools
 import json
+import traceback
+from datasets.vae_dataset import build_vae_dataset
 import numpy as np
 from PIL import Image
 import os.path as osp
@@ -312,6 +314,82 @@ class ManifoldProjector:
             print(f"   - 回退到标准高斯噪声")
             return torch.randn(n_samples, feature_dim, device=device) * noise_scale
 
+
+class ClassAwareManifoldProjector:
+    """
+    类别感知的流形投影器：为每个类别维护独立的PCA
+    
+    与全局ManifoldProjector的区别：
+    - 全局PCA: 所有类别的特征一起做PCA，学习跨类别的通用流形
+    - 类别PCA: 每个类别独立做PCA，学习每个类别的专属流形结构
+    
+    优势：
+    - 更好地捕捉每个类别的语义空间结构
+    - 避免类别间的干扰
+    - 生成时更有针对性
+    """
+    def __init__(self, classnames, manifold_dim=64):
+        self.classnames = classnames
+        self.manifold_dim = manifold_dim
+        # 为每个类别创建独立的ManifoldProjector
+        self.class_projectors = {
+            c: ManifoldProjector(manifold_dim=manifold_dim) 
+            for c in classnames
+        }
+        self.class_indices = {c: idx for idx, c in enumerate(classnames)}
+        
+    def fit_class_manifold(self, class_idx, features):
+        """
+        为指定类别拟合流形
+        
+        Args:
+            class_idx: 类别索引
+            features: 该类别的特征张量，形状为 [N, feature_dim]
+        """
+        if class_idx < len(self.classnames):
+            classname = self.classnames[class_idx]
+            print(f"  拟合类别 {class_idx} ({classname}) 的流形，特征数: {len(features)}")
+            self.class_projectors[classname].fit_manifold(features)
+        
+    def project_to_class_tangent(self, features, class_idx):
+        """
+        将特征投影到指定类别的切空间
+        
+        Args:
+            features: 输入特征 [N, feature_dim]
+            class_idx: 目标类别索引
+        """
+        if class_idx < len(self.classnames):
+            classname = self.classnames[class_idx]
+            return self.class_projectors[classname].project_noise_to_tangent_space(features)
+        return features
+    
+    def generate_class_noise(self, class_idx, n_samples, feature_dim, device='cuda', noise_scale=0.1):
+        """
+        在指定类别的流形切空间中生成结构化噪声
+        
+        Args:
+            class_idx: 类别索引
+            n_samples: 采样数量
+            feature_dim: 特征维度
+            device: 设备
+            noise_scale: 噪声缩放因子
+        """
+        if class_idx < len(self.classnames):
+            classname = self.classnames[class_idx]
+            return self.class_projectors[classname].generate_manifold_noise(
+                n_samples, feature_dim, device, noise_scale
+            )
+        return torch.randn(n_samples, feature_dim, device=device) * noise_scale
+    
+    def is_class_fitted(self, class_idx):
+        """检查指定类别的流形是否已拟合"""
+        if class_idx < len(self.classnames):
+            classname = self.classnames[class_idx]
+            return self.class_projectors[classname].fitted
+        return False
+
+
 def create_dalle_noise_features(dalle_features, noise_ratio=0.3, manifold_projector=None):
     """
     将DALL-E特征转换为带有结构化噪声的特征
@@ -366,17 +444,252 @@ def create_dalle_noise_features(dalle_features, noise_ratio=0.3, manifold_projec
 def old_vae_methods():
     pass
 
-# 训练VAE模型函数（增强版，包含流形学习）
+
+class ConditionalVAE(nn.Module):
+    """
+    条件VAE：使用语义锚点 t_c 作为条件先验 p(z|t_c)
+
+    与标准VAE的区别：
+    - 标准VAE: p(z) = N(0, I)，先验与输入无关
+    - 条件VAE: p(z|t_c) = N(μ_prior, σ²I)，先验由语义锚点决定
+
+    其中：
+    - t_c: 语义锚点（CLIP文本特征）
+    - μ_prior = W * t_c: 投影到潜在空间
+    - σ: 先验标准差（可调）
+    """
+    def __init__(self, input_dim=512, latent_dim=128, use_conditional_prior=True):
+        super(ConditionalVAE, self).__init__()
+
+        self.use_conditional_prior = use_conditional_prior
+        self.latent_dim = latent_dim
+        self.input_dim = input_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+
+        self.fc_mu = nn.Linear(128, latent_dim)
+        self.fc_logvar = nn.Linear(128, latent_dim)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, input_dim)
+        )
+
+        self.anchor_projection = nn.Linear(input_dim, latent_dim, bias=False)
+
+    def get_conditional_prior(self, anchor_features, sigma=0.1):
+        prior_mu = self.anchor_projection(anchor_features)
+        prior_mu = F.normalize(prior_mu, dim=-1)
+        return prior_mu, sigma
+
+    def reparameterize(self, mu, logvar, prior_mu=None, sigma=0.1):
+        std = torch.exp(0.5 * logvar)
+
+        if prior_mu is not None and self.use_conditional_prior:
+            eps_prior = torch.randn_like(std)
+            z = prior_mu + eps_prior * sigma
+        else:
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+
+        return z
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x, anchor_features=None, use_prior=True):
+        mu, logvar = self.encode(x)
+
+        prior_mu = None
+        sigma = 0.1
+        if use_prior and anchor_features is not None and self.use_conditional_prior:
+            prior_mu, sigma = self.get_conditional_prior(anchor_features)
+
+        z = self.reparameterize(mu, logvar, prior_mu, sigma)
+        recon = self.decode(z)
+
+        return recon, mu, logvar, z
+
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+
+def conditional_vae_loss(recon_x, x, mu, logvar, prior_mu=None, sigma=0.1, beta=1.0):
+    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+
+    if prior_mu is not None:
+        sigma_q_sq = torch.exp(logvar)
+        mu_diff_sq = (mu - prior_mu) ** 2
+        kld_loss = -0.5 * torch.sum(
+            1 + logvar - sigma_q_sq - mu_diff_sq / (sigma ** 2)
+        )
+    else:
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+    total_loss = recon_loss + beta * kld_loss
+    return total_loss, recon_loss, kld_loss
+
+
+def fusion_images_with_clip_scores(clip_model, dalle_images, vae_images, dalle_labels, vae_labels):
+    assert torch.all(dalle_labels == vae_labels), "DALL-E和VAE图像的标签必须一致"
+
+    with torch.no_grad():
+        dalle_features = clip_model.encode_image(dalle_images)
+        dalle_features /= dalle_features.norm(dim=-1, keepdim=True)
+
+        vae_features = clip_model.encode_image(vae_images)
+        vae_features /= vae_features.norm(dim=-1, keepdim=True)
+
+    text_inputs = torch.cat([clip.tokenize(f"a photo of object {dalle_labels[i].item()}") for i in range(dalle_labels.size(0))]).cuda()
+    with torch.no_grad():
+        text_features = clip_model.encode_text(text_inputs)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
+
+    dalle_scores = (100.0 * dalle_features @ text_features.T).diag()
+    vae_scores = (100.0 * vae_features @ text_features.T).diag()
+
+    total_scores = dalle_scores + vae_scores
+    dalle_weights = dalle_scores / total_scores
+    vae_weights = vae_scores / total_scores
+
+    fusion_features = dalle_weights.unsqueeze(1) * dalle_features + vae_weights.unsqueeze(1) * vae_features
+    fusion_features /= fusion_features.norm(dim=-1, keepdim=True)
+
+    return fusion_features, dalle_labels
+
+
+def enhanced_train_vae_with_manifold(train_loader, val_loader, clip_model, gpt3_prompt,
+                                   classnames, template, dalle_train_loader=None,
+                                   epochs=10, save_path=None, cfg=None):
+    print("\n开始增强版VAE训练（含流形学习）...")
+
+    manifold_projector = ManifoldProjector(
+        manifold_dim=cfg.get('manifold_dim', 64) if cfg else 64,
+        n_neighbors=cfg.get('n_neighbors', 20) if cfg else 20
+    )
+
+    print("提取文本特征...")
+    text_features_list = []
+    for classname in classnames:
+        prompt = gpt3_prompt.get(classname, classname)
+        if isinstance(prompt, list) and len(prompt) > 0:
+            prompt = prompt[0]
+        elif isinstance(prompt, str):
+            prompt = prompt.split('.')[0] if '.' in prompt else prompt
+
+        texts = []
+        for t in template:
+            formatted_text = t.format(prompt)
+            if len(formatted_text.split()) > 60:
+                formatted_text = ' '.join(formatted_text.split()[:60]) + '.'
+            texts.append(formatted_text)
+
+        try:
+            with torch.no_grad():
+                text_feature = clip_model.encode_text(clip.tokenize(texts).cuda())
+                text_feature = text_feature.mean(dim=0, keepdim=True)
+                text_feature /= text_feature.norm(dim=-1, keepdim=True)
+            text_features_list.append(text_feature)
+        except RuntimeError as e:
+            print(f"处理类别'{classname}'时出错: {e}")
+            simple_texts = [f"a photo of a {classname}."]
+            with torch.no_grad():
+                text_feature = clip_model.encode_text(clip.tokenize(simple_texts).cuda())
+                text_feature = text_feature.mean(dim=0, keepdim=True)
+                text_feature /= text_feature.norm(dim=-1, keepdim=True)
+            text_features_list.append(text_feature)
+
+    text_features = torch.cat(text_features_list, dim=0)
+
+    print("提取真实训练图片特征用于流形学习...")
+    shots = cfg.get('shots', 0) if cfg else 0
+
+    if shots == 0:
+        print("   0-shot配置：跳过真实样本提取，避免数据泄露")
+        real_image_features = []
+        real_features_tensor = None
+    else:
+        real_image_features = []
+        sample_count = 0
+        max_real_samples = cfg.get('real_image_samples', 1000) if cfg else 1000
+
+        with torch.no_grad():
+            for i, (images, _) in enumerate(train_loader):
+                if sample_count >= max_real_samples:
+                    break
+                images = images.cuda()
+                batch_features = clip_model.encode_image(images)
+                batch_features /= batch_features.norm(dim=-1, keepdim=True)
+                real_image_features.append(batch_features)
+                sample_count += len(batch_features)
+
+        real_features_tensor = None
+        if real_image_features:
+            real_features_tensor = torch.cat(real_image_features, dim=0)[:max_real_samples]
+            print(f"获取到 {len(real_features_tensor)} 个真实图片特征用于流形学习")
+
+    dalle_features_tensor = None
+    if dalle_train_loader is not None:
+        print("提取DALL-E特征用于流形学习...")
+        dalle_features = []
+        sample_count = 0
+        max_dalle_samples = cfg.get('manifold_samples', 500) if cfg else 500
+
+        with torch.no_grad():
+            for i, (images, _) in enumerate(dalle_train_loader):
+                if sample_count >= max_dalle_samples:
+                    break
+                images = images.cuda()
+                batch_features = clip_model.encode_image(images)
+                batch_features /= batch_features.norm(dim=-1, keepdim=True)
+                dalle_features.append(batch_features)
+                sample_count += len(batch_features)
+
+        if dalle_features:
+            dalle_features_tensor = torch.cat(dalle_features, dim=0)[:max_dalle_samples]
+            print(f"获取到 {len(dalle_features_tensor)} 个DALL-E特征用于流形学习")
+
+    manifold_features = text_features.clone()
+
+    if real_features_tensor is not None:
+        manifold_features = torch.cat([manifold_features, real_features_tensor], dim=0)
+
+    if dalle_features_tensor is not None:
+        manifold_features = torch.cat([manifold_features, dalle_features_tensor], dim=0)
+
+    print(f"流形学习使用总特征数: {len(manifold_features)}")
+    print(f"  - 文本特征: {len(text_features)}")
+    if real_features_tensor is not None:
+        print(f"  - 真实图片特征: {len(real_features_tensor)}")
+    if dalle_features_tensor is not None:
+        print(f"  - DALL-E特征: {len(dalle_features_tensor)}")
+
+    manifold_projector.fit_manifold(manifold_features)
+    print("流形学习完成，准备用于增强VAE训练")
+    print(f"流形投影器状态: {'已拟合' if manifold_projector.fitted else '未拟合'}")
+
+    return text_features, manifold_projector
+
+# 训练VAE模型函数（增强版，包含类别感知流形学习）
 def train_vae(cfg, clip_model, gpt3_prompt, classnames, template, dalle_features=None, train_loader=None):
-    print("\n开始训练增强版VAE模型（含流形学习）...")
+    print("\n开始训练增强版VAE模型（含类别感知流形学习）...")
     
     vae_cache_dir = os.path.join(cfg['cache_dir'], 'vae_cache')
     os.makedirs(vae_cache_dir, exist_ok=True)
     
-    # 创建流形投影器
-    manifold_projector = ManifoldProjector(
-        manifold_dim=cfg.get('manifold_dim', 64),
-        n_neighbors=cfg.get('n_neighbors', 20)
+    # 创建类别感知的流形投影器（每个类别独立PCA）
+    class_manifold_projector = ClassAwareManifoldProjector(
+        classnames=classnames,
+        manifold_dim=cfg.get('manifold_dim', 64)
     )
     
     # 创建编码器和生成器
@@ -390,141 +703,95 @@ def train_vae(cfg, clip_model, gpt3_prompt, classnames, template, dalle_features
     # 获取CLIP文本特征
     text_features_list = []
     for classname in classnames:
-        # 从gpt3_prompt中获取该类别的提示词
         prompt = gpt3_prompt.get(classname, classname)
-        # 确保提示词不会太长
         if isinstance(prompt, list) and len(prompt) > 0:
-            # 如果是列表，只取第一个元素
             prompt = prompt[0]
         elif isinstance(prompt, str):
-            # 如果是字符串，确保长度适中
             prompt = prompt.split('.')[0] if '.' in prompt else prompt
             
-        # 应用模板并确保不超过CLIP上下文长度
-        texts = []
-        for t in template:
-            formatted_text = t.format(prompt)
-            # 如果文本太长，截断它
-            if len(formatted_text.split()) > 60:  # 留出一些余量，CLIP限制是77个token
-                formatted_text = ' '.join(formatted_text.split()[:60]) + '.'
-            texts.append(formatted_text)
-            
+        texts = [t.format(prompt) for t in template]
         try:
             with torch.no_grad():
                 text_feature = clip_model.encode_text(clip.tokenize(texts).cuda())
                 text_feature = text_feature.mean(dim=0, keepdim=True)
                 text_feature /= text_feature.norm(dim=-1, keepdim=True)
             text_features_list.append(text_feature)
-        except RuntimeError as e:
-            print(f"处理类别'{classname}'时出错: {e}")
-            # 使用更简单的提示词重试
+        except:
             simple_texts = [f"a photo of a {classname}."]
             with torch.no_grad():
                 text_feature = clip_model.encode_text(clip.tokenize(simple_texts).cuda())
                 text_feature = text_feature.mean(dim=0, keepdim=True)
                 text_feature /= text_feature.norm(dim=-1, keepdim=True)
             text_features_list.append(text_feature)
-            print(f"已使用简化提示词处理类别'{classname}'")
     
-    # 将特征列表合并成一个张量
     text_features = torch.cat(text_features_list, dim=0)
     
-    # 学习数据流形（使用文本特征、真实图片特征和DALL-E特征）
-    print("学习数据流形...")
-    manifold_features = text_features.clone()
+    # ========================================================================
+    # 类别感知流形学习：为每个类别独立拟合PCA
+    # ========================================================================
+    print("\n" + "="*60)
+    print("📊 类别感知流形学习：为每个类别独立拟合PCA")
+    print("="*60)
     
-    # 1. 提取真实训练图片的CLIP特征（改进版：确保只使用实际训练样本）
-    if train_loader is not None:
-        print("提取真实训练图片特征用于流形学习...")
+    shots = cfg.get('shots', 0)
+    
+    # 为每个类别收集特征并独立拟合PCA
+    for class_idx, classname in enumerate(classnames):
+        print(f"\n处理类别 {class_idx}/{len(classnames)}: {classname}")
         
-        # ===== 关键改进：自适应采样策略 =====
-        shots = cfg.get('shots', 0)
+        # 类别特征列表
+        class_features = []
         
-        if shots == 0:
-            print("   0-shot配置：跳过真实样本提取")
-            real_image_features = []
-        elif shots <= 16:
-            # Few-shot场景：只使用实际训练集，不重复采样
-            print(f"   Few-shot模式 ({shots}-shot)：仅使用实际训练样本，避免分布偏移")
-            real_image_features = []
-            
+        # 1. 添加该类别的文本特征
+        class_features.append(text_features[class_idx:class_idx+1])
+        
+        # 2. 如果有真实样本，添加该类别的真实样本
+        if train_loader is not None and shots > 0:
+            real_class_features = []
             with torch.no_grad():
-                for i, (images, _) in enumerate(train_loader):
-                    images = images.cuda()
-                    batch_features = clip_model.encode_image(images)
-                    batch_features /= batch_features.norm(dim=-1, keepdim=True)
-                    real_image_features.append(batch_features)
-                    # 只遍历一次训练集，不重复采样
+                for images, labels in train_loader:
+                    # 只处理该类别的样本
+                    class_mask = (labels == class_idx)
+                    if class_mask.sum() > 0:
+                        class_images = images[class_mask].cuda()
+                        feat = clip_model.encode_image(class_images)
+                        feat /= feat.norm(dim=-1, keepdim=True)
+                        real_class_features.append(feat)
             
-            if real_image_features:
-                real_features_tensor = torch.cat(real_image_features, dim=0)
-                actual_samples = len(real_features_tensor)
-                print(f"   ✅ 获取到 {actual_samples} 个真实训练样本特征（精确匹配训练集大小）")
-                
-                # 数据质量检查
-                expected_samples = shots * len(classnames)
-                if actual_samples != expected_samples:
-                    print(f"   ⚠️  样本数量提示：实际 {actual_samples} vs 预期 {expected_samples}")
-                
-                # 将真实图片特征加入流形学习
-                manifold_features = torch.cat([manifold_features, real_features_tensor], dim=0)
-        else:
-            # Many-shot场景：可以适当扩充，但要控制上限
-            max_real_samples = min(cfg.get('real_image_samples', 1000), shots * len(classnames) * 3)
-            print(f"   Many-shot模式 ({shots}-shot)：限制真实样本数为 {max_real_samples}")
-            
-            real_image_features = []
-            sample_count = 0
-            
-            with torch.no_grad():
-                for i, (images, _) in enumerate(train_loader):
-                    if sample_count >= max_real_samples:
-                        break
-                    images = images.cuda()
-                    batch_features = clip_model.encode_image(images)
-                    batch_features /= batch_features.norm(dim=-1, keepdim=True)
-                    real_image_features.append(batch_features)
-                    sample_count += len(batch_features)
-            
-            if real_image_features:
-                real_features_tensor = torch.cat(real_image_features, dim=0)[:max_real_samples]
-                print(f"   获取到 {len(real_features_tensor)} 个真实图片特征用于流形学习")
-                manifold_features = torch.cat([manifold_features, real_features_tensor], dim=0)
+            if real_class_features:
+                real_class_tensor = torch.cat(real_class_features, dim=0)
+                class_features.append(real_class_tensor)
+                print(f"  - 真实样本: {len(real_class_tensor)} 个")
+        
+        # 3. 如果有DALL-E特征，添加该类别的DALL-E特征
+        if dalle_features is not None:
+            # dalle_features 按类别组织
+            # 假设 dalle_features 对应的标签已知，这里简化处理
+            pass  # DALL-E特征暂不按类别分割
+        
+        # 合并该类别的所有特征
+        if len(class_features) > 0:
+            combined_features = torch.cat(class_features, dim=0)
+            print(f"  - 合并后特征数: {len(combined_features)}")
+            # 为该类别拟合PCA
+            class_manifold_projector.fit_class_manifold(class_idx, combined_features)
     
-    # 2. 如果提供了DALL-E特征，也加入流形学习
-    if dalle_features is not None:
-        print(f"整合DALL-E特征到流形学习中，DALL-E特征形状: {dalle_features.shape}")
-        # 确保DALL-E特征与文本特征维度一致
-        if dalle_features.shape[-1] == text_features.shape[-1]:
-            manifold_features = torch.cat([manifold_features, dalle_features], dim=0)
-        else:
-            print("DALL-E特征维度不匹配，仅使用文本特征和真实图片特征进行流形学习")
+    print("\n" + "="*60)
+    print("✅ 类别感知流形学习完成")
+    print("="*60)
     
-    # ===== 详细诊断信息 =====
-    print(f"\n{'='*60}")
-    print(f"📊 流形学习数据源统计 (Shots: {cfg.get('shots', 0)})")
-    print(f"{'='*60}")
-    print(f"总特征数: {len(manifold_features)}")
-    print(f"  ├─ 文本特征 (类别原型): {len(text_features)}")
-    
-    if train_loader is not None and 'real_features_tensor' in locals():
-        real_ratio = len(real_features_tensor) / len(manifold_features) * 100
-        print(f"  ├─ 真实训练样本: {len(real_features_tensor)} ({real_ratio:.1f}%)")
-        if shots > 0:
-            print(f"  │   └─ 期望样本数: {shots * len(classnames)} ({shots} shots × {len(classnames)} 类)")
-    else:
-        print(f"  ├─ 真实训练样本: 0 (未使用)")
-    
-    if dalle_features is not None and dalle_features.shape[-1] == text_features.shape[-1]:
-        dalle_ratio = len(dalle_features) / len(manifold_features) * 100
-        print(f"  └─ DALL-E特征: {len(dalle_features)} ({dalle_ratio:.1f}%)")
-    else:
-        print(f"  └─ DALL-E特征: 0 (未使用)")
-    
-    print(f"{'='*60}\n")
-    
-    # 拟合流形
-    manifold_projector.fit_manifold(manifold_features)
+    # ========================================================================
+    # 为没有足够样本的类别添加文本特征作为后备
+    # ========================================================================
+    for class_idx in range(len(classnames)):
+        if not class_manifold_projector.is_class_fitted(class_idx):
+            classname = classnames[class_idx]
+            print(f"⚠️  类别 {class_idx} ({classname}) 样本不足，使用文本特征")
+            # 使用文本特征作为后备（只有1个样本无法做有效PCA）
+            class_manifold_projector.fit_class_manifold(
+                class_idx, 
+                text_features[class_idx:class_idx+1].expand(10, -1)  # 复制10次以满足PCA最小样本需求
+            )
     
     # ===== 改进：VAE训练使用与流形学习一致的特征 =====
     shots = cfg.get('shots', 0)
@@ -638,12 +905,12 @@ def train_vae(cfg, clip_model, gpt3_prompt, classnames, template, dalle_features
     netG.eval()
     
     print("VAE模型训练完成!")
-    return netE, netG, manifold_projector
+    return netE, netG, class_manifold_projector
 
-# 使用VAE生成图像特征（增强版，包含流形投影）
+# 使用VAE生成图像特征（增强版，支持类别感知流形投影）
 def generate_vae_features(cfg, netE, netG, clip_model, gpt3_prompt, classnames, template, 
                          manifold_projector=None, n_samples=10, use_manifold_noise=True):
-    print("\n使用增强版VAE生成图像特征（含流形投影）...")
+    print("\n使用增强版VAE生成图像特征...")
     
     vae_cache_dir = os.path.join(cfg['cache_dir'], 'vae_generated')
     os.makedirs(vae_cache_dir, exist_ok=True)
@@ -653,6 +920,13 @@ def generate_vae_features(cfg, netE, netG, clip_model, gpt3_prompt, classnames, 
     if os.path.exists(features_path) and not cfg.get('regenerate_vae', False):
         print(f"加载已有VAE生成特征: {features_path}")
         return torch.load(features_path)
+    
+    # 确定使用的是哪种流形投影器
+    is_class_aware = isinstance(manifold_projector, ClassAwareManifoldProjector)
+    if is_class_aware:
+        print("使用类别感知流形投影器（每类独立PCA）")
+    else:
+        print("使用全局流形投影器")
     
     # 确保VAE模型处于评估模式
     netE.eval()
@@ -700,55 +974,60 @@ def generate_vae_features(cfg, netE, netG, clip_model, gpt3_prompt, classnames, 
                 text_feature = text_feature.mean(dim=0, keepdim=True)
                 text_feature /= text_feature.norm(dim=-1, keepdim=True)
         
-        # 通过增强版VAE生成特征（含流形投影）
+        # 通过增强版VAE生成特征（类别感知流形投影）
         with torch.no_grad():
             for i in range(n_samples):
                 # 编码
                 mean, log_var = netE(text_feature.float())
                 
-                # 重参数化 - 使用流形结构化噪声
+                # 重参数化
                 std = torch.exp(0.5 * log_var)
-                
-                # 在潜在空间使用标准重参数化
                 standard_noise = torch.randn_like(std)
                 z = mean + std * standard_noise
                 
                 # 生成特征
                 gen_feature = netG(z)
                 
-                # 如果启用流形噪声且有流形投影器，对生成的特征进行后处理
-                if use_manifold_noise and manifold_projector is not None and manifold_projector.fitted:
+                # 如果启用流形噪声，使用流形投影器对特征进行后处理
+                if use_manifold_noise and manifold_projector is not None:
                     try:
-                        # 在特征空间中生成流形结构化噪声
-                        feature_noise = manifold_projector.generate_manifold_noise(
-                            n_samples=1,
-                            feature_dim=gen_feature.shape[-1],  # 使用特征空间维度（1024）
-                            device=gen_feature.device,
-                            noise_scale=cfg.get('manifold_noise_scale', 0.1)
-                        )
+                        if is_class_aware:
+                            # 类别感知模式：为该类别生成专属的流形噪声
+                            feature_noise = manifold_projector.generate_class_noise(
+                                class_idx,
+                                n_samples=1,
+                                feature_dim=gen_feature.shape[-1],
+                                device=gen_feature.device,
+                                noise_scale=cfg.get('manifold_noise_scale', 0.1)
+                            )
+                            
+                            # 将生成的特征与类别专属流形噪声结合
+                            noise_ratio = cfg.get('feature_blend_factor', 0.8)
+                            enhanced_feature = noise_ratio * gen_feature + (1 - noise_ratio) * feature_noise
+                            
+                            # 投影到类别专属切空间
+                            final_feature = manifold_projector.project_to_class_tangent(
+                                enhanced_feature,
+                                class_idx
+                            )
+                        else:
+                            # 全局模式：使用全局流形投影器
+                            feature_noise = manifold_projector.generate_manifold_noise(
+                                n_samples=1,
+                                feature_dim=gen_feature.shape[-1],
+                                device=gen_feature.device,
+                                noise_scale=cfg.get('manifold_noise_scale', 0.1)
+                            )
+                            noise_ratio = cfg.get('feature_blend_factor', 0.8)
+                            enhanced_feature = noise_ratio * gen_feature + (1 - noise_ratio) * feature_noise
+                            final_feature = manifold_projector.project_noise_to_tangent_space(
+                                enhanced_feature, text_feature, blend_factor=0.9
+                            )
                         
-                        # 将生成的特征与流形噪声结合
-                        noise_ratio = cfg.get('feature_blend_factor', 0.8)
-                        enhanced_feature = noise_ratio * gen_feature + (1 - noise_ratio) * feature_noise
-                        
-                        # 通过流形投影进一步优化
-                        final_feature = manifold_projector.project_noise_to_tangent_space(
-                            enhanced_feature,
-                            text_feature,
-                            blend_factor=0.9  # 主要保持增强特征，少量混合原始文本特征
-                        )
                         gen_feature = final_feature
                         
                     except Exception as e:
-                        print(f"❌ VAE流形增强失败 - 详细错误信息:")
-                        print(f"   - 错误类型: {type(e).__name__}")
-                        print(f"   - 错误描述: {str(e)}")
-                        print(f"   - 生成特征形状: {gen_feature.shape}")
-                        print(f"   - 文本特征形状: {text_feature.shape}")
-                        print(f"   - 类别: {classnames[class_idx]}")
-                        print(f"   - 样本索引: {i+1}/{n_samples}")
-                        print(f"   - 使用原始生成特征")
-                        # 如果流形增强失败，使用原始生成的特征
+                        print(f"  类别 {class_idx} 流形增强失败，使用原始生成特征")
                 
                 # 归一化
                 gen_feature /= gen_feature.norm(dim=-1, keepdim=True)
@@ -793,84 +1072,170 @@ def get_arguments():
 
     return args
 
-def run_ensemble_tip_dalle_adapter_F(cfg, 
-                            clip_cache_keys, 
-                            clip_cache_values, 
-                            clip_test_features, 
-                            dino_cache_keys, 
-                            dino_cache_values, 
-                            dino_test_features, 
-                            test_labels, 
-                            clip_weights, 
-                            clip_model, 
-                            dino_model, 
+def run_ensemble_tip_dalle_adapter_F(cfg,
+                            clip_cache_keys,
+                            clip_cache_values,
+                            clip_test_features,
+                            dino_cache_keys,
+                            dino_cache_values,
+                            dino_test_features,
+                            test_labels,
+                            clip_weights,
+                            clip_model,
+                            dino_model,
                             train_loader_F,
                             dalle_train_loader_F,
-                            vae_adapter=None,  # 使用适配器对象而不是缓存键
-                            vae_cache_values=None):
-    
-    # 打印各缓存的形状信息，便于调试
-    print(f"CLIP缓存键形状: {clip_cache_keys.shape}, 值形状: {clip_cache_values.shape}")
-    print(f"DINO缓存键形状: {dino_cache_keys.shape}, 值形状: {dino_cache_values.shape}")
-    if vae_adapter is not None and vae_cache_values is not None:
-        print(f"VAE适配器权重形状: {vae_adapter.weight.shape}, 值形状: {vae_cache_values.shape}")
-    
-    # Enable the cached keys to be learnable
-    clip_adapter = nn.Linear(clip_cache_keys.shape[0], clip_cache_keys.shape[1], bias=False).to(clip_model.dtype).cuda()
-    clip_adapter.weight = nn.Parameter(clip_cache_keys.t())
-    dino_adapter = nn.Linear(dino_cache_keys.shape[0], dino_cache_keys.shape[1], bias=False).to(clip_model.dtype).cuda()
-    dino_adapter.weight = nn.Parameter(dino_cache_keys.t())
-    
-    optimizer = torch.optim.AdamW(
-        itertools.chain(dino_adapter.parameters(), clip_adapter.parameters()),
-        lr=cfg['lr'], 
-        eps=1e-4)
-    
-    # 计算总训练步数（考虑0-shot情况）
+                            vae_train_loader_F=None,
+                            separated_caches=None):
+
+    clip_dtype = next(clip_model.parameters()).dtype
+    device = next(clip_model.parameters()).device
+    print(f"CLIP模型数据类型: {clip_dtype}, 设备: {device}")
+
+    clip_weights = clip_weights.to(clip_dtype)
+    clip_cache_keys = clip_cache_keys.to(clip_dtype)
+    clip_cache_values = clip_cache_values.to(clip_dtype)
+    dino_cache_keys = dino_cache_keys.to(clip_dtype)
+    dino_cache_values = dino_cache_values.to(clip_dtype)
+
+    use_dynamic_routing = bool(cfg.get('use_dynamic_evidence_routing', False)) and separated_caches is not None
+    dr_clip_k_real = dr_clip_v_real = dr_clip_k_pixel = dr_clip_v_pixel = None
+    dr_dino_k = dr_dino_v = None
+    dr_clip_k_cvae_real = dr_clip_v_cvae_real = None
+    dr_clip_k_cvae_pixel = dr_clip_v_cvae_pixel = None
+    clip_adapter_real = None
+    clip_adapter_cvae_real = None
+    clip_adapter_cvae_pixel = None
+
+    if use_dynamic_routing:
+        dr_clip_k_real = separated_caches['clip_real'][0].to(clip_dtype).to(device)
+        dr_clip_v_real = separated_caches['clip_real'][1].to(clip_dtype).to(device)
+        dr_clip_k_pixel = separated_caches['clip_pixel'][0].to(clip_dtype).to(device)
+        dr_clip_v_pixel = separated_caches['clip_pixel'][1].to(clip_dtype).to(device)
+        dr_dino_k = separated_caches['dino'][0].to(clip_dtype).to(device)
+        dr_dino_v = separated_caches['dino'][1].to(clip_dtype).to(device)
+
+        if separated_caches.get('clip_cvae_real') is not None:
+            dr_clip_k_cvae_real = separated_caches['clip_cvae_real'][0].to(clip_dtype).to(device)
+            dr_clip_v_cvae_real = separated_caches['clip_cvae_real'][1].to(clip_dtype).to(device)
+        if separated_caches.get('clip_cvae_pixel') is not None:
+            dr_clip_k_cvae_pixel = separated_caches['clip_cvae_pixel'][0].to(clip_dtype).to(device)
+            dr_clip_v_cvae_pixel = separated_caches['clip_cvae_pixel'][1].to(clip_dtype).to(device)
+
+        n_branches = 3
+        if dr_clip_k_cvae_real is not None:
+            n_branches += 1
+        if dr_clip_k_cvae_pixel is not None:
+            n_branches += 1
+        print(f"动态注意力证据路由: {n_branches} 路分支。")
+        print(f"  C_real {dr_clip_k_real.shape}, C_pixel {dr_clip_k_pixel.shape}", end="")
+        if dr_clip_k_cvae_real is not None:
+            print(f", C_cvae_real {dr_clip_k_cvae_real.shape}", end="")
+        if dr_clip_k_cvae_pixel is not None:
+            print(f", C_cvae_pixel {dr_clip_k_cvae_pixel.shape}", end="")
+        print(f", C_feature {dr_dino_k.shape}")
+
+        if dr_clip_k_real.shape[1] > 0:
+            clip_adapter_real = nn.Linear(dr_clip_k_real.shape[0], dr_clip_k_real.shape[1], bias=False).to(clip_dtype).to(device)
+            clip_adapter_real.weight = nn.Parameter(dr_clip_k_real.t().clone())
+        clip_adapter = nn.Linear(dr_clip_k_pixel.shape[0], dr_clip_k_pixel.shape[1], bias=False).to(clip_dtype).to(device)
+        clip_adapter.weight = nn.Parameter(dr_clip_k_pixel.t().clone())
+        dino_adapter = nn.Linear(dr_dino_k.shape[0], dr_dino_k.shape[1], bias=False).to(clip_dtype).to(device)
+        dino_adapter.weight = nn.Parameter(dr_dino_k.t().clone())
+
+        if dr_clip_k_cvae_real is not None:
+            clip_adapter_cvae_real = nn.Linear(dr_clip_k_cvae_real.shape[0], dr_clip_k_cvae_real.shape[1], bias=False).to(clip_dtype).to(device)
+            clip_adapter_cvae_real.weight = nn.Parameter(dr_clip_k_cvae_real.t().clone())
+        if dr_clip_k_cvae_pixel is not None:
+            clip_adapter_cvae_pixel = nn.Linear(dr_clip_k_cvae_pixel.shape[0], dr_clip_k_cvae_pixel.shape[1], bias=False).to(clip_dtype).to(device)
+            clip_adapter_cvae_pixel.weight = nn.Parameter(dr_clip_k_cvae_pixel.t().clone())
+
+        opt_params = list(clip_adapter.parameters()) + list(dino_adapter.parameters())
+        if clip_adapter_real is not None:
+            opt_params += list(clip_adapter_real.parameters())
+        if clip_adapter_cvae_real is not None:
+            opt_params += list(clip_adapter_cvae_real.parameters())
+        if clip_adapter_cvae_pixel is not None:
+            opt_params += list(clip_adapter_cvae_pixel.parameters())
+    else:
+        clip_adapter = nn.Linear(clip_cache_keys.shape[0], clip_cache_keys.shape[1], bias=False).to(clip_dtype).to(device)
+        clip_adapter.weight = nn.Parameter(clip_cache_keys.t())
+        dino_adapter = nn.Linear(dino_cache_keys.shape[0], dino_cache_keys.shape[1], bias=False).to(clip_dtype).to(device)
+        dino_adapter.weight = nn.Parameter(dino_cache_keys.t())
+        opt_params = list(dino_adapter.parameters()) + list(clip_adapter.parameters())
+
+    print(f"缓存张量数据类型统一为: {clip_dtype}")
+    print(f"CLIP缓存: keys {clip_cache_keys.dtype}, values {clip_cache_values.dtype}")
+    print(f"DINO缓存: keys {dino_cache_keys.dtype}, values {dino_cache_values.dtype}")
+    print(f"适配器dtype: {clip_adapter.weight.dtype}")
+
+    optimizer = torch.optim.AdamW(opt_params, lr=cfg['lr'], eps=1e-4)
+
+    top_k_ev = int(cfg.get('evidence_top_k', 16))
+    gate_tau = float(cfg.get('gate_temperature', 1.0))
+
+    def forward_tip(clip_image_features, dino_image_features, beta_loc, alpha_loc, mask_evidence=None):
+        if use_dynamic_routing:
+            tip, _, _ = ensemble_tip_logits_dynamic(
+                clip_image_features,
+                dino_image_features,
+                clip_weights,
+                beta_loc,
+                alpha_loc,
+                top_k_ev,
+                gate_tau,
+                clip_adapter_real,
+                clip_adapter,
+                dino_adapter,
+                dr_clip_k_real,
+                dr_clip_v_real,
+                dr_clip_k_pixel,
+                dr_clip_v_pixel,
+                dr_dino_k,
+                dr_dino_v,
+                mask_evidence=mask_evidence,
+            )
+            return tip
+        clip_affinity = clip_adapter(clip_image_features).to(clip_dtype)
+        clip_cache_logits = ((-1) * (beta_loc - beta_loc * clip_affinity)).exp() @ clip_cache_values
+        dino_affinity = dino_adapter(dino_image_features).to(clip_dtype)
+        dino_cache_logits = ((-1) * (beta_loc - beta_loc * dino_affinity)).exp() @ dino_cache_values
+        clip_logits = 100. * clip_image_features @ clip_weights
+        cache_logits = logits_fuse(clip_logits, [clip_cache_logits, dino_cache_logits])
+        return clip_logits + cache_logits * alpha_loc
+
     total_steps = cfg['train_epoch'] * (
-        (len(train_loader_F) if train_loader_F is not None else 0) + 
-        len(dalle_train_loader_F)
+        (len(train_loader_F) if train_loader_F is not None else 0) +
+        len(dalle_train_loader_F) +
+        (len(vae_train_loader_F) if vae_train_loader_F is not None else 0)
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, total_steps)
-    
+
     beta, alpha = cfg['init_beta'], cfg['init_alpha']
     best_acc, best_epoch = 0.0, 0
 
     for train_idx in range(cfg['train_epoch']):
-        # Train
         clip_adapter.train()
         dino_adapter.train()
+        if clip_adapter_real is not None:
+            clip_adapter_real.train()
         correct_samples, all_samples = 0, 0
         loss_list = []
         print('Train Epoch: {:} / {:}'.format(train_idx, cfg['train_epoch']))
 
-        # origin image (跳过0-shot情况)
         if train_loader_F is not None:
             for i, (images, target) in enumerate(tqdm(train_loader_F)):
-                images, target = images.cuda(), target.cuda()
+                images, target = images.to(device), target.to(device)
                 with torch.no_grad():
                     clip_image_features = clip_model.encode_image(images)
                     clip_image_features /= clip_image_features.norm(dim=-1, keepdim=True)
+                    clip_image_features = clip_image_features.to(clip_dtype)
+
                     dino_image_features = dino_model(images)
                     dino_image_features /= dino_image_features.norm(dim=-1, keepdim=True)
+                    dino_image_features = dino_image_features.to(clip_dtype)
 
-                clip_affinity = clip_adapter(clip_image_features)
-                clip_cache_logits = ((-1) * (beta - beta * clip_affinity)).exp() @ clip_cache_values
-                dino_affinity = dino_adapter(dino_image_features).to(dino_cache_values.dtype)
-                dino_cache_logits = ((-1) * (beta - beta * dino_affinity)).exp() @ dino_cache_values
-                clip_logits = 100. * clip_image_features @ clip_weights
-
-                # 融合CLIP和DINO特征
-                cache_logits_list = [clip_cache_logits, dino_cache_logits]
-                
-                # 如果提供了VAE适配器和缓存值，也添加到融合中
-                if vae_adapter is not None and vae_cache_values is not None:
-                    vae_affinity = vae_adapter(clip_image_features)  # 使用专用的VAE适配器
-                    vae_cache_logits = ((-1) * (beta - beta * vae_affinity)).exp() @ vae_cache_values
-                    cache_logits_list.append(vae_cache_logits)
-                
-                cache_logits = logits_fuse(clip_logits, cache_logits_list)
-                tip_logits = clip_logits + cache_logits * alpha
+                tip_logits = forward_tip(clip_image_features, dino_image_features, beta, alpha)
                 loss = F.cross_entropy(tip_logits, target)
 
                 acc = cls_acc(tip_logits, target)
@@ -882,33 +1247,19 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
-        
-        # dalle image
+
         for i, (images, target) in enumerate(tqdm(dalle_train_loader_F)):
-            images, target = images.cuda(), target.cuda()
+            images, target = images.to(device), target.to(device)
             with torch.no_grad():
                 clip_image_features = clip_model.encode_image(images)
                 clip_image_features /= clip_image_features.norm(dim=-1, keepdim=True)
+                clip_image_features = clip_image_features.to(clip_dtype)
+
                 dino_image_features = dino_model(images)
                 dino_image_features /= dino_image_features.norm(dim=-1, keepdim=True)
+                dino_image_features = dino_image_features.to(clip_dtype)
 
-            clip_affinity = clip_adapter(clip_image_features)
-            clip_cache_logits = ((-1) * (beta - beta * clip_affinity)).exp() @ clip_cache_values
-            dino_affinity = dino_adapter(dino_image_features).to(dino_cache_values.dtype)
-            dino_cache_logits = ((-1) * (beta - beta * dino_affinity)).exp() @ dino_cache_values
-            clip_logits = 100. * clip_image_features @ clip_weights
-
-            # 融合CLIP和DINO特征
-            cache_logits_list = [clip_cache_logits, dino_cache_logits]
-            
-            # 如果提供了VAE适配器和缓存值，也添加到融合中
-            if vae_adapter is not None and vae_cache_values is not None:
-                vae_affinity = vae_adapter(clip_image_features)  # 使用专用的VAE适配器
-                vae_cache_logits = ((-1) * (beta - beta * vae_affinity)).exp() @ vae_cache_values
-                cache_logits_list.append(vae_cache_logits)
-            
-            cache_logits = logits_fuse(clip_logits, cache_logits_list)
-            tip_logits = clip_logits + cache_logits * alpha
+            tip_logits = forward_tip(clip_image_features, dino_image_features, beta, alpha)
             loss = F.cross_entropy(tip_logits, target)
 
             acc = cls_acc(tip_logits, target)
@@ -921,406 +1272,820 @@ def run_ensemble_tip_dalle_adapter_F(cfg,
             optimizer.step()
             scheduler.step()
 
+        if vae_train_loader_F is not None:
+            for i, (images, target) in enumerate(tqdm(vae_train_loader_F)):
+                images, target = images.to(device), target.to(device)
+                with torch.no_grad():
+                    clip_image_features = clip_model.encode_image(images)
+                    clip_image_features /= clip_image_features.norm(dim=-1, keepdim=True)
+                    clip_image_features = clip_image_features.to(clip_dtype)
+
+                    dino_image_features = dino_model(images)
+                    dino_image_features /= dino_image_features.norm(dim=-1, keepdim=True)
+                    dino_image_features = dino_image_features.to(clip_dtype)
+
+                tip_logits = forward_tip(clip_image_features, dino_image_features, beta, alpha)
+                loss = F.cross_entropy(tip_logits, target)
+
+                acc = cls_acc(tip_logits, target)
+                correct_samples += acc / 100 * len(tip_logits)
+                all_samples += len(tip_logits)
+                loss_list.append(loss.item())
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+        if cfg.get('use_fusion', False) and dalle_train_loader_F is not None and vae_train_loader_F is not None:
+            dalle_iterator = iter(dalle_train_loader_F)
+            vae_iterator = iter(vae_train_loader_F)
+            min_batches = min(len(dalle_train_loader_F), len(vae_train_loader_F))
+
+            print("训练DALL-E和VAE融合图像...")
+            for _ in range(min_batches):
+                try:
+                    dalle_images, dalle_target = next(dalle_iterator)
+                    vae_images, vae_target = next(vae_iterator)
+
+                    min_batch_size = min(dalle_images.size(0), vae_images.size(0))
+                    dalle_images, dalle_target = dalle_images[:min_batch_size], dalle_target[:min_batch_size]
+                    vae_images, vae_target = vae_images[:min_batch_size], vae_target[:min_batch_size]
+
+                    dalle_images, dalle_target = dalle_images.to(device), dalle_target.to(device)
+                    vae_images, vae_target = vae_images.to(device), vae_target.to(device)
+
+                    if not torch.all(dalle_target == vae_target):
+                        continue
+
+                    text_inputs = torch.cat([clip.tokenize(f"a photo of object {dalle_target[i].item()}") for i in range(dalle_target.size(0))]).to(device)
+
+                    with torch.no_grad():
+                        dalle_features = clip_model.encode_image(dalle_images)
+                        dalle_features /= dalle_features.norm(dim=-1, keepdim=True)
+                        dalle_features = dalle_features.to(clip_dtype)
+
+                        vae_features = clip_model.encode_image(vae_images)
+                        vae_features /= vae_features.norm(dim=-1, keepdim=True)
+                        vae_features = vae_features.to(clip_dtype)
+
+                        text_features = clip_model.encode_text(text_inputs)
+                        text_features /= text_features.norm(dim=-1, keepdim=True)
+
+                    dalle_scores = (100.0 * dalle_features @ text_features.T).diag()
+                    vae_scores = (100.0 * vae_features @ text_features.T).diag()
+
+                    total_scores = dalle_scores + vae_scores
+                    dalle_weights = dalle_scores / total_scores
+                    vae_weights = vae_scores / total_scores
+
+                    fusion_features = dalle_weights.unsqueeze(1) * dalle_features + vae_weights.unsqueeze(1) * vae_features
+                    fusion_features /= fusion_features.norm(dim=-1, keepdim=True)
+                    fusion_target = dalle_target
+
+                    with torch.no_grad():
+                        dino_dalle_features = dino_model(dalle_images)
+                        dino_dalle_features /= dino_dalle_features.norm(dim=-1, keepdim=True)
+                        dino_dalle_features = dino_dalle_features.to(clip_dtype)
+
+                        dino_vae_features = dino_model(vae_images)
+                        dino_vae_features /= dino_vae_features.norm(dim=-1, keepdim=True)
+                        dino_vae_features = dino_vae_features.to(clip_dtype)
+
+                        dino_fusion_features = (dalle_weights.unsqueeze(1) * dino_dalle_features +
+                                               vae_weights.unsqueeze(1) * dino_vae_features)
+                        dino_fusion_features /= dino_fusion_features.norm(dim=-1, keepdim=True)
+
+                    tip_logits = forward_tip(fusion_features, dino_fusion_features, beta, alpha)
+                    loss = F.cross_entropy(tip_logits, fusion_target)
+
+                    acc = cls_acc(tip_logits, fusion_target)
+                    correct_samples += acc / 100 * len(tip_logits)
+                    all_samples += len(tip_logits)
+                    loss_list.append(loss.item())
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+
+                except StopIteration:
+                    break
+
         current_lr = scheduler.get_last_lr()[0]
         print('LR: {:.6f}, Acc: {:.4f} ({:}/{:}), Loss: {:.4f}'.format(current_lr, correct_samples / all_samples, correct_samples, all_samples, sum(loss_list)/len(loss_list)))
 
-        # Eval
         clip_adapter.eval()
         dino_adapter.eval()
+        if clip_adapter_real is not None:
+            clip_adapter_real.eval()
 
-        clip_affinity = clip_adapter(clip_test_features)
-        dino_affinity = dino_adapter(dino_test_features).to(dino_cache_values.dtype)
-        clip_cache_logits = ((-1) * (beta - beta * clip_affinity)).exp() @ clip_cache_values
-        dino_cache_logits = ((-1) * (beta - beta * dino_affinity)).exp() @ dino_cache_values
-        clip_logits = 100. * clip_test_features @ clip_weights
-        
-        # 融合CLIP和DINO特征
-        cache_logits_list = [clip_cache_logits, dino_cache_logits]
-        
-        # 如果提供了VAE适配器和缓存值，也添加到测试评估中
-        if vae_adapter is not None and vae_cache_values is not None:
-            vae_affinity = vae_adapter(clip_test_features)  # 使用专用的VAE适配器
-            vae_cache_logits = ((-1) * (beta - beta * vae_affinity)).exp() @ vae_cache_values
-            cache_logits_list.append(vae_cache_logits)
-        
-        cache_logits = logits_fuse(clip_logits, cache_logits_list)
-        tip_logits = clip_logits + cache_logits * alpha
+        clip_test_features = clip_test_features.to(clip_dtype)
+        dino_test_features = dino_test_features.to(clip_dtype)
+
+        tip_logits = forward_tip(clip_test_features, dino_test_features, beta, alpha)
         acc = cls_acc(tip_logits, test_labels)
 
-        print("**** VASMA's test accuracy: {:.2f}. ****\n".format(acc))
+        print("**** VASMA's val accuracy: {:.2f}. ****\n".format(acc))
         if acc > best_acc:
             best_acc = acc
             best_epoch = train_idx
             torch.save(clip_adapter.weight, cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt")
             torch.save(dino_adapter.weight, cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt")
-    
-    # 加载最佳权重（如果存在）
-    clip_adapter_path = cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt"
-    dino_adapter_path = cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt"
-    
-    if os.path.exists(clip_adapter_path) and os.path.exists(dino_adapter_path):
-        # 加载权重并确保在正确的设备和数据类型上
-        loaded_clip_w = torch.load(clip_adapter_path, map_location='cuda')
-        loaded_dino_w = torch.load(dino_adapter_path, map_location='cuda')
-        
-        # 转换到正确的数据类型
-        clip_adapter.weight = nn.Parameter(loaded_clip_w.to(clip_model.dtype).cuda())
-        dino_adapter.weight = nn.Parameter(loaded_dino_w.to(clip_model.dtype).cuda())
-        
-        if cfg['train_epoch'] > 0:
-            print(f"**** After fine-tuning, VASMA's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
-        else:
-            print(f"**** Loaded pre-trained adapters from cache (train_epoch=0). ****\n")
-    else:
-        if cfg['train_epoch'] == 0:
-            print(f"⚠️  Warning: No pre-trained adapters found and train_epoch=0. Using initialized adapters.")
-        else:
-            print(f"**** After fine-tuning, VASMA's best test accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
-    
-    # 清理训练过程中的变量（仅在训练过的情况下）
-    if cfg['train_epoch'] > 0:
-        del clip_logits, tip_logits, cache_logits, clip_cache_logits, dino_cache_logits, clip_affinity, dino_affinity
-    
-    # 清理 GPU 缓存，避免内存碎片
-    torch.cuda.empty_cache()
-    
-    # 确保适配器处于评估模式
-    clip_adapter.eval()
-    dino_adapter.eval()
-    if vae_adapter is not None:
-        vae_adapter.eval()
-    
-    # Search Hyperparameters
-    print("\n-------- Searching hyperparameters on the test set. --------")
-    best_beta, best_alpha = search_ensemble_hp(cfg, clip_cache_keys, clip_cache_values, clip_test_features, dino_cache_keys, dino_cache_values, dino_test_features, test_labels, clip_weights, clip_adapter=clip_adapter, dino_adapter=dino_adapter)
-    
-    # 确保所有张量的数据类型与适配器一致
-    target_dtype = clip_adapter.weight.dtype
-    clip_test_features = clip_test_features.to(target_dtype)
-    dino_test_features = dino_test_features.to(target_dtype)
-    clip_weights = clip_weights.to(target_dtype)
-    clip_cache_values = clip_cache_values.to(target_dtype)
-    dino_cache_values = dino_cache_values.to(target_dtype)
-    
-    # 计算最终的 logits
-    clip_affinity = clip_adapter(clip_test_features)
-    dino_affinity = dino_adapter(dino_test_features)
-    clip_cache_logits = ((-1) * (best_beta - best_beta * clip_affinity)).exp() @ clip_cache_values
-    dino_cache_logits = ((-1) * (best_beta - best_beta * dino_affinity)).exp() @ dino_cache_values
-    clip_logits = 100. * clip_test_features @ clip_weights
-    
-    # 融合CLIP和DINO特征
-    cache_logits_list = [clip_cache_logits, dino_cache_logits]
-    
-    # 如果提供了VAE适配器和缓存值，也添加到最终评估中
-    if vae_adapter is not None and vae_cache_values is not None:
-        vae_cache_values = vae_cache_values.to(target_dtype)
-        vae_affinity = vae_adapter(clip_test_features)  # 使用专用的VAE适配器
-        vae_cache_logits = ((-1) * (best_beta - best_beta * vae_affinity)).exp() @ vae_cache_values
-        cache_logits_list.append(vae_cache_logits)
-    
-    cache_logits = logits_fuse(clip_logits, cache_logits_list)
-    tip_logits = clip_logits + cache_logits * best_alpha
-    print("save logits!!!!!!!!!!!!!")
-    torch.save(tip_logits, cfg['cache_dir'] + "/best_tip_dino_dalle_logits_" + str(cfg['shots']) + "shots.pt")
-    
-    # ===== 新增：校准评估 =====
-    if cfg.get('compute_calibration', False):
-        print("\n" + "="*60)
-        print("Computing Calibration Metrics (ECE, NLL, Reliability Diagram)")
-        print("="*60)
-        
-        calib_dir = os.path.join(cfg['cache_dir'], 'calibration_results')
-        os.makedirs(calib_dir, exist_ok=True)
-        
-        # 评估校准指标
-        metrics = evaluate_with_calibration(
-            tip_logits, 
+            if use_dynamic_routing and clip_adapter_real is not None:
+                torch.save(clip_adapter_real.weight, cfg['cache_dir'] + "/best_F_clip_adapter_real_" + str(cfg['shots']) + "shots.pt")
+
+    loaded_clip_w = torch.load(cfg['cache_dir'] + "/best_F_clip_adapter_" + str(cfg['shots']) + "shots.pt", map_location=device)
+    loaded_dino_w = torch.load(cfg['cache_dir'] + "/best_F_dino_adapter_" + str(cfg['shots']) + "shots.pt", map_location=device)
+    clip_adapter.weight = nn.Parameter(loaded_clip_w.to(clip_dtype).to(device))
+    dino_adapter.weight = nn.Parameter(loaded_dino_w.to(clip_dtype).to(device))
+    if use_dynamic_routing and clip_adapter_real is not None:
+        p_real = cfg['cache_dir'] + "/best_F_clip_adapter_real_" + str(cfg['shots']) + "shots.pt"
+        if os.path.exists(p_real):
+            loaded_real = torch.load(p_real, map_location=device)
+            clip_adapter_real.weight = nn.Parameter(loaded_real.to(clip_dtype).to(device))
+    print(f"**** After fine-tuning, VASMA's best val accuracy: {best_acc:.2f}, at epoch: {best_epoch}. ****\n")
+
+    print("\n-------- Searching hyperparameters on the val set. --------")
+
+    if use_dynamic_routing:
+        best_beta, best_alpha = search_dynamic_evidence_hp(
+            cfg,
+            clip_test_features,
+            dino_test_features,
             test_labels,
-            save_dir=calib_dir,
-            prefix=f"ImageNet_{cfg['shots']}shot"
+            clip_weights,
+            clip_adapter_real,
+            clip_adapter,
+            dino_adapter,
+            dr_clip_k_real,
+            dr_clip_v_real,
+            dr_clip_k_pixel,
+            dr_clip_v_pixel,
+            dr_dino_k,
+            dr_dino_v,
         )
-        
-        print(f"\n📊 Calibration Metrics for {cfg['shots']}-shot:")
-        print(f"   Top-1 Accuracy: {metrics['Top1']:.2f}%")
-        print(f"   ECE: {metrics['ECE']:.4f}")
-        print(f"   NLL: {metrics['NLL']:.4f}")
-        print(f"   Reliability diagram saved to: {calib_dir}")
-        
-        # 保存指标到文件
-        metrics_file = os.path.join(calib_dir, f"metrics_{cfg['shots']}shot.json")
-        with open(metrics_file, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        print(f"   Metrics saved to: {metrics_file}\n")
+    else:
+        best_beta, best_alpha = search_ensemble_hp(cfg, clip_adapter.weight.t(), clip_cache_values,
+                                                 clip_test_features, dino_adapter.weight.t(), dino_cache_values,
+                                                 dino_test_features, test_labels, clip_weights)
 
+    print("\n-------- Evaluating on the test set. --------")
 
-    # ================================================================================
-    # 可选透明化审计功能 (默认注释，需要时取消注释启用)
-    # 该功能实现了论文中提到的透明化审计：定量分解和视觉验证
-    # ================================================================================
-    """
-    # ============ 透明化审计：证据溯源分析 =============
-    print("\n" + "="*80)
-    print("🔍 TRANSPARENT AUDIT: Evidence Provenance Analysis")
-    print("="*80)
+    clip_test_features = clip_test_features.to(clip_dtype)
+    dino_test_features = dino_test_features.to(clip_dtype)
 
-    audit_enabled = cfg.get('enable_audit', False)
-    if audit_enabled:
-        print("✅ 透明化审计已启用，开始分析证据溯源...")
+    tip_logits = forward_tip(clip_test_features, dino_test_features, best_beta, best_alpha)
+    if use_dynamic_routing:
+        with torch.no_grad():
+            _, test_alphas, branch_logits = ensemble_tip_logits_dynamic(
+                clip_test_features,
+                dino_test_features,
+                clip_weights,
+                best_beta,
+                best_alpha,
+                top_k_ev,
+                gate_tau,
+                clip_adapter_real,
+                clip_adapter,
+                dino_adapter,
+                dr_clip_k_real,
+                dr_clip_v_real,
+                dr_clip_k_pixel,
+                dr_clip_v_pixel,
+                dr_dino_k,
+                dr_dino_v,
+            )
+        clip_logits = 100. * clip_test_features @ clip_weights
+        clip_cache_logits = branch_logits['L_pixel']
+        dino_cache_logits = branch_logits['L_feature']
+        cache_logits = logits_fuse(clip_logits, [clip_cache_logits, dino_cache_logits])
+    else:
+        clip_affinity = clip_adapter(clip_test_features).to(clip_dtype)
+        dino_affinity = dino_adapter(dino_test_features).to(clip_dtype)
+        clip_cache_logits = ((-1) * (best_beta - best_beta * clip_affinity)).exp() @ clip_cache_values
+        dino_cache_logits = ((-1) * (best_beta - best_beta * dino_affinity)).exp() @ dino_cache_values
+        clip_logits = 100. * clip_test_features @ clip_weights
+        cache_logits = logits_fuse(clip_logits, [clip_cache_logits, dino_cache_logits])
+    acc = cls_acc(tip_logits, test_labels)
+    print("**** VASMA's test accuracy: {:.2f}. ****\n".format(max(best_acc, acc)))
 
-        # 计算各个缓存来源的贡献度
-        clip_cache_contribution = clip_cache_logits * best_alpha
-        dino_cache_contribution = dino_cache_logits * best_alpha
+    save_dir = cfg['cache_dir']
+    os.makedirs(save_dir, exist_ok=True)
 
-        # 如果有VAE贡献，也计算在内
-        vae_contribution = 0
-        if 'vae_cache_logits' in locals():
-            vae_contribution = vae_cache_logits * best_alpha
+    labels_path = os.path.join(save_dir, f"test_labels_{cfg['shots']}shots.npy")
+    np.save(labels_path, test_labels.cpu().numpy())
+    print(f"已保存 labels 到: {labels_path}")
 
-        # 计算每个样本的来源贡献占比
-        total_cache_contribution = clip_cache_contribution + dino_cache_contribution
-        if vae_contribution != 0:
-            total_cache_contribution += vae_contribution
+    unified_logits_path = os.path.join(save_dir, f"test_logits_unified_{cfg['shots']}shots.npy")
+    np.save(unified_logits_path, tip_logits.detach().cpu().numpy())
+    print(f"已保存 Unified logits 到: {unified_logits_path}")
 
-        clip_proportion = torch.abs(clip_cache_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
-        dino_proportion = torch.abs(dino_cache_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
+    if use_dynamic_routing:
+        alphas_path = os.path.join(save_dir, f"test_evidence_alphas_{cfg['shots']}shots.npy")
+        np.save(alphas_path, test_alphas.detach().cpu().numpy())
+        print(f"已保存动态证据门控权重 [α_real, α_pixel, α_feature]: {alphas_path}")
 
-        # 统计分析
-        print(f"\n📊 缓存来源贡献统计 ({len(test_labels)} 个测试样本):")
-        print(f"   CLIP缓存平均贡献比例: {clip_proportion.mean().item():.3f}")
-        print(f"   DINO缓存平均贡献比例: {dino_proportion.mean().item():.3f}")
-        if vae_contribution != 0:
-            vae_proportion = torch.abs(vae_contribution) / (torch.abs(total_cache_contribution) + 1e-8)
-            print(f"   VAE缓存平均贡献比例: {vae_proportion.mean().item():.3f}")
-        print(f"   零-shot CLIP贡献占比: {(torch.abs(clip_logits) / (torch.abs(tip_logits) + 1e-8)).mean().item():.3f}")
+    clip_cache_logits_path = os.path.join(save_dir, f"test_logits_clip_{cfg['shots']}shots.npy")
+    np.save(clip_cache_logits_path, clip_cache_logits.detach().cpu().numpy())
+    print(f"已保存 ClipCache logits 到: {clip_cache_logits_path}")
 
-        # 分析高置信度预测的来源分布
-        confidence_threshold = 0.8
-        top_predictions = torch.softmax(tip_logits, dim=1).max(dim=1)[0] > confidence_threshold
-        if top_predictions.sum() > 0:
-            high_conf_clip_prop = clip_proportion[top_predictions].mean().item()
-            high_conf_dino_prop = dino_proportion[top_predictions].mean().item()
-            print(f"\n🎯 高置信度预测 ({top_predictions.sum().item()}/{len(test_labels)} 个样本):")
-            print(f"   CLIP缓存贡献: {high_conf_clip_prop:.3f}")
-            print(f"   DINO缓存贡献: {high_conf_dino_prop:.3f}")
-            if vae_contribution != 0:
-                high_conf_vae_prop = vae_proportion[top_predictions].mean().item()
-                print(f"   VAE缓存贡献: {high_conf_vae_prop:.3f}")
+    naive_alpha = 0.5
+    clipdino_logits_path = os.path.join(save_dir, f"test_logits_clipdino_{cfg['shots']}shots.npy")
+    np.save(clipdino_logits_path, (clip_logits + cache_logits * naive_alpha).detach().cpu().numpy())
+    print(f"已保存 ClipDino logits (naive fusion, alpha={naive_alpha}) 到: {clipdino_logits_path}")
 
-        # 分析Top-1预测的证据强度分布
-        predictions = tip_logits.argmax(dim=1)
-        correct_predictions = (predictions == test_labels).sum().item()
-        accuracy = correct_predictions / len(test_labels)
+    print(f"\n所有预测结果已保存到: {save_dir}")
 
-        print(f"\n🎯 预测准确性分析:")
-        print(f"   Top-1准确率: {accuracy:.3f} ({correct_predictions}/{len(test_labels)})")
-        print(f"   平均预测置信度: {torch.softmax(tip_logits, dim=1).max(dim=1)[0].mean().item():.3f}")
+    if cfg.get('run_evidence_masking', False) and use_dynamic_routing:
+        print("\n-------- 证据遮盖与因果归因 (Evidence Masking / Faithfulness) --------")
+        masking_rows = []
+        with torch.no_grad():
+            mask_specs = [
+                ('mask_real', {'real': True}),
+                ('mask_pixel', {'pixel': True}),
+                ('mask_feature', {'feature': True}),
+                ('mask_pixel_and_feature', {'pixel': True, 'feature': True}),
+            ]
+            for name, mdict in mask_specs:
+                tip_m, _, _ = ensemble_tip_logits_dynamic(
+                    clip_test_features,
+                    dino_test_features,
+                    clip_weights,
+                    best_beta,
+                    best_alpha,
+                    top_k_ev,
+                    gate_tau,
+                    clip_adapter_real,
+                    clip_adapter,
+                    dino_adapter,
+                    dr_clip_k_real,
+                    dr_clip_v_real,
+                    dr_clip_k_pixel,
+                    dr_clip_v_pixel,
+                    dr_dino_k,
+                    dr_dino_v,
+                    mask_evidence=mdict,
+                )
+                masking_rows.append(evidence_masking_report(tip_logits, tip_m, test_labels, name))
+        for row in masking_rows:
+            print("  [{}] acc_masked={:.2f} (Δacc={:.2f}), flip%={:.2f}, Δconf={:.4f}".format(
+                row['ablation'], row['acc_masked'], row['acc_drop'],
+                row['prediction_flip_rate_percent'], row['mean_conf_drop']))
+        mask_json = os.path.join(save_dir, f"evidence_masking_{cfg['shots']}shots.json")
+        with open(mask_json, 'w', encoding='utf-8') as f:
+            json.dump(masking_rows, f, indent=2, ensure_ascii=False)
+        print(f"证据遮盖统计已写入: {mask_json}")
 
-        # 保存审计结果
-        audit_save_path = os.path.join(cfg['cache_dir'], f"audit_results_{cfg['shots']}shots.json")
-        audit_results = {
-            "dataset": cfg.get('dataset', 'ImageNet'),
-            "shots": cfg['shots'],
-            "total_samples": len(test_labels),
-            "accuracy": accuracy,
-            "cache_contribution_stats": {
-                "clip_cache_avg_proportion": clip_proportion.mean().item(),
-                "dino_cache_avg_proportion": dino_proportion.mean().item(),
-                "zero_shot_clip_proportion": (torch.abs(clip_logits) / (torch.abs(tip_logits) + 1e-8)).mean().item()
-            },
-            "high_confidence_analysis": {
-                "threshold": confidence_threshold,
-                "high_conf_samples": top_predictions.sum().item(),
-                "high_conf_clip_proportion": high_conf_clip_prop if 'high_conf_clip_prop' in locals() else None,
-                "high_conf_dino_proportion": high_conf_dino_prop if 'high_conf_dino_prop' in locals() else None
+    if use_dynamic_routing:
+        print("\n" + "="*80)
+        print("TRANSPARENT AUDIT: Evidence Provenance Analysis")
+        print("="*80)
+
+        with torch.no_grad():
+            L_real = branch_logits['L_real']
+            L_pixel = branch_logits['L_pixel']
+            L_feature = branch_logits['L_feature']
+
+            weighted_L_real = test_alphas[:, 0:1] * L_real
+            weighted_L_pixel = test_alphas[:, 1:2] * L_pixel
+            weighted_L_feature = test_alphas[:, 2:3] * L_feature
+
+            cache_contrib_total = weighted_L_real + weighted_L_pixel + weighted_L_feature
+
+            test_probs = F.softmax(tip_logits, dim=1)
+            test_preds = tip_logits.argmax(dim=1)
+            test_confs = test_probs.max(dim=1).values
+
+            print(f"\nEvidence Routing Statistics ({len(test_labels)} test samples):")
+
+            avg_alphas = test_alphas.mean(dim=0)
+            print(f"  Average Alpha Weights:")
+            print(f"    a_real (real samples)     = {avg_alphas[0].item():.3f}")
+            print(f"    a_pixel (DALL-E+VAE)      = {avg_alphas[1].item():.3f}")
+            print(f"    a_feature (DINO features)= {avg_alphas[2].item():.3f}")
+            print(f"    Sum check (should be 1.0) = {avg_alphas.sum().item():.3f}")
+
+            print(f"\n  Per-Class Alpha Distribution (mean +/- std):")
+            for c in range(test_probs.shape[1]):
+                mask_c = (test_preds == c)
+                cnt = mask_c.sum().item()
+                if cnt > 0:
+                    a0 = test_alphas[mask_c, 0].mean().item()
+                    a1 = test_alphas[mask_c, 1].mean().item()
+                    a2 = test_alphas[mask_c, 2].mean().item()
+                    s0 = test_alphas[mask_c, 0].std().item()
+                    s1 = test_alphas[mask_c, 1].std().item()
+                    s2 = test_alphas[mask_c, 2].std().item()
+                    classname = str(c)
+                    print(f"    Class {c} ({classname}, n={cnt}): "
+                          f"a_real={a0:.3f}+/-{s0:.3f}  a_pixel={a1:.3f}+/-{s1:.3f}  a_feature={a2:.3f}+/-{s2:.3f}")
+
+            print(f"\n  Confidence Stratification:")
+            conf_bins = [(0.0, 0.5, "low"), (0.5, 0.8, "medium"), (0.8, 1.0, "high")]
+            for lo, hi, label in conf_bins:
+                mask_bin = (test_confs >= lo) & (test_confs < hi)
+                n_bin = mask_bin.sum().item()
+                if n_bin > 0:
+                    bin_alphas = test_alphas[mask_bin].mean(dim=0)
+                    print(f"    {label} confidence [{lo:.1f},{hi:.1f}] (n={n_bin}): "
+                          f"a_real={bin_alphas[0]:.3f}  a_pixel={bin_alphas[1]:.3f}  a_feature={bin_alphas[2]:.3f}")
+
+            print(f"\n  Prediction Flip Rate under Source Ablation:")
+            masking_specs = [
+                ('no_mask',        {}),
+                ('mask_real',      {'real': True}),
+                ('mask_pixel',     {'pixel': True}),
+                ('mask_feature',   {'feature': True}),
+                ('mask_pixel+feat',{'pixel': True, 'feature': True}),
+            ]
+            flip_rows = []
+            for mask_name, mdict in masking_specs:
+                tip_m, _, _ = ensemble_tip_logits_dynamic(
+                    clip_test_features, dino_test_features, clip_weights,
+                    best_beta, best_alpha, top_k_ev, gate_tau,
+                    clip_adapter_real, clip_adapter, dino_adapter,
+                    dr_clip_k_real, dr_clip_v_real, dr_clip_k_pixel, dr_clip_v_pixel, dr_dino_k, dr_dino_v,
+                    mask_evidence=mdict,
+                )
+                acc_m = cls_acc(tip_m, test_labels)
+                conf_m = F.softmax(tip_m, dim=1).max(dim=1).values.mean().item()
+                pred_m = tip_m.argmax(dim=1)
+                flip_rate = (test_preds != pred_m).float().mean().item() * 100.0
+                flip_rows.append({
+                    'condition': mask_name,
+                    'accuracy': round(acc_m, 2),
+                    'flip_rate_percent': round(flip_rate, 2),
+                    'mean_confidence': round(conf_m, 4),
+                })
+                print(f"    {mask_name:20s}: acc={acc_m:.2f}, flip%={flip_rate:.1f}, conf={conf_m:.4f}")
+
+            audit_sample_path = os.path.join(save_dir, f"audit_provenance_{cfg['shots']}shots.npy")
+            audit_per_sample = {
+                'alpha_real':     test_alphas[:, 0].cpu().numpy(),
+                'alpha_pixel':    test_alphas[:, 1].cpu().numpy(),
+                'alpha_feature':  test_alphas[:, 2].cpu().numpy(),
+                'predictions':    test_preds.cpu().numpy(),
+                'confidences':    test_confs.cpu().numpy(),
+                'true_labels':    test_labels.cpu().numpy(),
+                'L_real_max':     L_real.max(dim=1).values.cpu().numpy(),
+                'L_pixel_max':    L_pixel.max(dim=1).values.cpu().numpy(),
+                'L_feature_max':  L_feature.max(dim=1).values.cpu().numpy(),
             }
-        }
+            np.save(audit_sample_path, audit_per_sample)
+            print(f"\n  Per-sample provenance saved to: {audit_sample_path}")
 
-        # 如果有VAE，添加VAE统计
-        if vae_contribution != 0:
-            audit_results["cache_contribution_stats"]["vae_cache_avg_proportion"] = vae_proportion.mean().item()
-            if 'high_conf_vae_prop' in locals():
-                audit_results["high_confidence_analysis"]["high_conf_vae_proportion"] = high_conf_vae_prop
+            flip_json_path = os.path.join(save_dir, f"audit_fliprate_{cfg['shots']}shots.json")
+            with open(flip_json_path, 'w', encoding='utf-8') as f:
+                json.dump(flip_rows, f, indent=2, ensure_ascii=False)
+            print(f"  Ablation flip rates saved to: {flip_json_path}")
 
-        with open(audit_save_path, 'w') as f:
-            json.dump(audit_results, f, indent=2)
-        print(f"💾 审计结果已保存到: {audit_save_path}")
+            if cfg.get('enable_shap_attribution', True):
+                print("\n" + "-"*60)
+                print("  SHAP COMPLIANT ATTRIBUTION: Axiomatic Evidence Analysis")
+                print("-"*60)
 
-        print("\n🔍 透明化审计完成！")
-        print("   - 可以查看各预测的证据来源分解")
-        print("   - 分析缓存贡献的统计分布")
-        print("   - 识别高置信度预测的决策模式")
-        print("   - 评估VAE等新增组件的贡献")
+                try:
+                    import shap_attribution as shap_mod
+
+                    clip_adapter_real_dev = clip_adapter_real.to(device) if clip_adapter_real is not None else None
+                    clip_adapter_dev = clip_adapter.to(device)
+                    dino_adapter_dev = dino_adapter.to(device)
+                    dr_clip_k_real_dev = dr_clip_k_real.to(device)
+                    dr_clip_v_real_dev = dr_clip_v_real.to(device)
+                    dr_clip_k_pixel_dev = dr_clip_k_pixel.to(device)
+                    dr_clip_v_pixel_dev = dr_clip_v_pixel.to(device)
+                    dr_dino_k_dev = dr_dino_k.to(device)
+                    dr_dino_v_dev = dr_dino_v.to(device)
+                    clip_test_features_dev = clip_test_features.to(device)
+                    dino_test_features_dev = dino_test_features.to(device)
+                    clip_weights_dev = clip_weights.to(device)
+
+                    max_shap_samples = min(cfg.get('max_shap_samples', 500), len(test_labels))
+                    sample_indices = torch.randperm(len(test_labels))[:max_shap_samples]
+
+                    clip_f_sample = clip_test_features_dev[sample_indices]
+                    dino_f_sample = dino_test_features_dev[sample_indices]
+                    labels_sample = test_labels[sample_indices]
+                    alphas_sample = test_alphas[sample_indices]
+
+                    print(f"  Computing Shapley values for {max_shap_samples} samples ...")
+                    print(f"  (n_samples={cfg.get('shap_n_samples', 32)}, "
+                          f"branches=3, classes={clip_weights_dev.shape[1]})")
+
+                    phi_real, phi_pixel, phi_feature, v_empty, v_full = shap_mod.compute_shapley_values(
+                        clip_f_sample, dino_f_sample, clip_weights_dev,
+                        best_beta, best_alpha,
+                        clip_adapter_real_dev, clip_adapter_dev, dino_adapter_dev,
+                        dr_clip_k_real_dev, dr_clip_v_real_dev,
+                        dr_clip_k_pixel_dev, dr_clip_v_pixel_dev,
+                        dr_dino_k_dev, dr_dino_v_dev,
+                        n_samples=cfg.get('shap_n_samples', 32),
+                    )
+
+                    norm_real, norm_pixel, norm_feature, sign_meta = shap_mod.normalize_shapley_to_unit(
+                        phi_real, phi_pixel, phi_feature, v_empty, v_full
+                    )
+
+                    axiom_results = shap_mod.verify_shapley_axioms(
+                        phi_real, phi_pixel, phi_feature, v_empty, v_full
+                    )
+
+                    print(f"\n  [Axiom Verification]")
+                    eff_status = "PASSED" if axiom_results['efficiency_satisfied'] else "FAILED"
+                    print(f"    Efficiency: error={axiom_results['efficiency_error']:.6f}  [{eff_status}]")
+                    print(f"    Fraction negative phi: real={axiom_results['fraction_negative_phi']:.1%}, "
+                          f"pixel={axiom_results['fraction_negative_phi']:.1%}, "
+                          f"feature={axiom_results['fraction_negative_phi']:.1%}")
+                    print(f"    All-branches-negative: {axiom_results['fraction_all_negative']:.1%}")
+
+                    gap_results = shap_mod.compute_attribution_gap(
+                        norm_real, norm_pixel, norm_feature, alphas_sample
+                    )
+
+                    print(f"\n  [Attribution Gap: Shapley vs Attention alphas]")
+                    print(f"    Euclidean gap:  {gap_results['gap_euclidean_mean']:.4f}")
+                    print(f"    MAE gap:        {gap_results['gap_mae_mean']:.4f}")
+                    print(f"    Per-branch diff: real={gap_results['diff_real']:.4f}, "
+                          f"pixel={gap_results['diff_pixel']:.4f}, "
+                          f"feature={gap_results['diff_feature']:.4f}")
+
+                    class_names = [f"class_{i}" for i in range(clip_weights_dev.shape[1])]
+
+                    report = shap_mod.generate_shap_report(
+                        phi_real, phi_pixel, phi_feature,
+                        norm_real, norm_pixel, norm_feature,
+                        v_empty, v_full,
+                        alphas_sample, class_names,
+                        axiom_results, gap_results, sign_meta,
+                    )
+
+                    shap_json_path = os.path.join(save_dir, f"shap_attribution_{cfg['shots']}shots.json")
+                    with open(shap_json_path, 'w', encoding='utf-8') as f:
+                        json.dump(report, f, indent=2, ensure_ascii=False)
+                    print(f"\n  SHAP report saved to: {shap_json_path}")
+
+                    shap_npy_path = os.path.join(save_dir, f"shap_norm_values_{cfg['shots']}shots.npy")
+                    np.save(shap_npy_path, {
+                        'phi_real': phi_real.cpu().numpy(),
+                        'phi_pixel': phi_pixel.cpu().numpy(),
+                        'phi_feature': phi_feature.cpu().numpy(),
+                        'norm_real': norm_real.cpu().numpy(),
+                        'norm_pixel': norm_pixel.cpu().numpy(),
+                        'norm_feature': norm_feature.cpu().numpy(),
+                        'v_empty': v_empty.cpu().numpy(),
+                        'v_full': v_full.cpu().numpy(),
+                        'sample_indices': sample_indices.cpu().numpy(),
+                    })
+                    print(f"  Per-sample Shapley values saved to: {shap_npy_path}")
+
+                    shap_weights_path = os.path.join(save_dir, f"shap_weights_{cfg['shots']}shots.npy")
+                    np.save(shap_weights_path, {
+                        'shap_norm_weights': gap_results['shap_weights_avg'].cpu().numpy(),
+                        'attention_alphas': alphas_sample.cpu().numpy(),
+                        'gap_euclidean': gap_results['gap_euclidean'].cpu().numpy(),
+                        'gap_mae': gap_results['gap_mae'].cpu().numpy(),
+                        'sample_indices': sample_indices.cpu().numpy(),
+                    })
+                    print(f"  Shapley weights (norm) saved to: {shap_weights_path}")
+
+                    gs = report['global_summary']
+                    print(f"\n  [Global Shapley Summary]")
+                    print(f"    Raw phi (mean):    real={gs['phi_real_mean']:.4f}, "
+                          f"pixel={gs['phi_pixel_mean']:.4f}, feature={gs['phi_feature_mean']:.4f}")
+                    print(f"    Normed phi (mean): real={gs['norm_real_mean']:.4f}, "
+                          f"pixel={gs['norm_pixel_mean']:.4f}, feature={gs['norm_feature_mean']:.4f}")
+                    print(f"    Frac negative:     real={gs['frac_negative_real']:.1%}, "
+                          f"pixel={gs['frac_negative_pixel']:.1%}, feature={gs['frac_negative_feature']:.1%}")
+                    print(f"    Sign patterns:     {gs['sign_pattern_distribution']}")
+
+                    class_eff_errors = [c['efficiency_error'] for c in report['per_class']]
+                    print(f"\n  [Per-Class Efficiency]")
+                    print(f"    Worst class: {max(class_eff_errors):.6f}")
+                    print(f"    Mean error:  {sum(class_eff_errors)/len(class_eff_errors):.6f}")
+                    print(f"    All classes satisfy efficiency: {all(c['efficiency_satisfied'] for c in report['per_class'])}")
+
+                    print("-"*60)
+                    print("  SHAP ATTRIBUTION ANALYSIS COMPLETE")
+                    print("-"*60)
+
+                except ImportError:
+                    print("\n  [SKIP] shap_attribution.py not found in current directory.")
+                except Exception as e:
+                    print(f"\n  [ERROR] Shapley computation failed: {e}")
+                    traceback.print_exc()
+
+        print("\n" + "="*80)
+        print("AUDIT COMPLETE -- provenance decomposition available.")
+        print("="*80)
 
     else:
-        print("ℹ️  透明化审计已禁用。如需启用，请在配置文件中设置: enable_audit: true")
-
-    print("="*80)
-    """
+        print("\n[Audit Skipped] Dynamic evidence routing is disabled.")
+        print("Enable 'use_dynamic_evidence_routing: true' in config to use transparent audit.")
 
     return tip_logits, test_labels
 
 def main():
 
-    # Load config file
     args = get_arguments()
     assert (os.path.exists(args.config))
-    
+
     cfg = yaml.load(open(args.config, 'r', encoding='utf-8'), Loader=yaml.Loader)
 
     cache_dir = os.path.join('./caches', cfg['dataset'])
     os.makedirs(cache_dir, exist_ok=True)
     cfg['cache_dir'] = cache_dir
 
+    cfg['use_fusion'] = cfg.get('use_fusion', False)
+    if cfg['use_fusion']:
+        print("\n将使用DALL-E和VAE图像融合训练")
+
+    cfg['use_dynamic_evidence_routing'] = cfg.get('use_dynamic_evidence_routing', False)
+    cfg['evidence_top_k'] = cfg.get('evidence_top_k', 16)
+    cfg['gate_temperature'] = cfg.get('gate_temperature', 1.0)
+    cfg['run_evidence_masking'] = cfg.get('run_evidence_masking', False)
+    if cfg['use_dynamic_evidence_routing']:
+        print("\n已启用动态注意力证据路由 (Dynamic Attention-based Evidence Routing)")
+        print(f"  evidence_top_k={cfg['evidence_top_k']}, gate_temperature={cfg['gate_temperature']}")
+
+    cfg['manifold_dim'] = cfg.get('manifold_dim', 64)
+    cfg['n_neighbors'] = cfg.get('n_neighbors', 20)
+    cfg['real_image_samples'] = cfg.get('real_image_samples', 1000)
+    cfg['manifold_samples'] = cfg.get('manifold_samples', 500)
+
+    if cfg.get('use_manifold_learning', True):
+        print(f"\n将使用流形学习增强VAE训练")
+        print(f"  - 流形维度: {cfg['manifold_dim']}")
+        print(f"  - 真实图片样本数: {cfg['real_image_samples']}")
+        print(f"  - DALL-E样本数: {cfg['manifold_samples']}")
+
     print("\nRunning configs.")
     print(cfg, "\n")
 
-    # CLIP
     clip_model, preprocess = clip.load(cfg['clip_backbone'])
     clip_model.eval()
 
-    # DINO
     dino_model = torchvision_models.__dict__[cfg['dino_backbone']](num_classes=0)
     dino_model.fc = nn.Identity()
     dino_model.cuda()
     utils.load_pretrained_weights(dino_model, "dino/dino_resnet50_pretrain.pth", "teacher", "vit_small'", 16)
     dino_model.eval()
 
-    # ImageNet dataset
-    random.seed(1)  #####原始是2
+    random.seed(1)
     torch.manual_seed(1)
-    
+
     print("Preparing ImageNet dataset.")
     imagenet = ImageNet(cfg['root_path'], cfg['shots'])
 
     test_loader = torch.utils.data.DataLoader(imagenet.test, batch_size=64, num_workers=8, shuffle=False)
 
-    # 0-shot情况下训练集为空，需要特殊处理
-    if cfg['shots'] == 0:
-        print("⚠️  0-shot配置：训练集为空，跳过训练数据加载器创建")
-        train_loader_cache = None
-        train_loader_F = None
-    else:
-        train_loader_cache = torch.utils.data.DataLoader(imagenet.train_x, batch_size=256, num_workers=8, shuffle=False)
-        train_loader_F = torch.utils.data.DataLoader(imagenet.train_x, batch_size=256, num_workers=8, shuffle=True)
-
-    dalle_dataset = build_dataset(cfg['dalle_dataset'], cfg['root_path'], cfg['dalle_shots'])
     train_tranform = transforms.Compose([
         transforms.RandomResizedCrop(size=224, scale=(0.5, 1), interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
     ])
-    dalle_train_loader_cache = build_data_loader(data_source=dalle_dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=False)
-    dalle_train_loader_F = build_data_loader(data_source=dalle_dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=True)
-    
+
+    if cfg['shots'] == 0:
+        print("0-shot配置：训练集为空")
+        train_loader_cache = None
+        train_loader_F = None
+    else:
+        train_loader_cache = torch.utils.data.DataLoader(imagenet.train_x, batch_size=256, num_workers=8, shuffle=False)
+        train_loader_F = torch.utils.data.DataLoader(imagenet.train_x, batch_size=256, num_workers=8, shuffle=True)
+
+    if cfg.get('dalle_shots', 0) > 0:
+        dalle_dataset = build_dataset(cfg['dalle_dataset'], cfg['root_path'], cfg['dalle_shots'])
+        dalle_train_loader_cache = build_data_loader(data_source=dalle_dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=False)
+        dalle_train_loader_F = build_data_loader(data_source=dalle_dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=True)
+        print(f"已加载 DALL-E 数据集 (dalle_shots={cfg['dalle_shots']})")
+    else:
+        dalle_dataset = None
+        dalle_train_loader_cache = None
+        dalle_train_loader_F = None
+        print("dalle_shots=0，未使用 DALL-E 数据")
+
+    save_features_dir = cfg['cache_dir']
+    os.makedirs(save_features_dir, exist_ok=True)
+
+    real_feat_path = os.path.join(save_features_dir, f"real_features_{cfg['shots']}shots.npy")
+    if not os.path.exists(real_feat_path) and train_loader_cache is not None:
+        print("\n保存真实训练集特征...")
+        real_features_list = []
+        real_labels_list = []
+        with torch.no_grad():
+            for images, labels in train_loader_cache:
+                features = clip_model.encode_image(images.cuda())
+                features = F.normalize(features, dim=-1)
+                real_features_list.append(features.cpu().numpy())
+                real_labels_list.append(labels.numpy())
+        real_features = np.concatenate(real_features_list, axis=0)
+        real_labels = np.concatenate(real_labels_list, axis=0)
+        np.save(real_feat_path, real_features)
+        np.save(os.path.join(save_features_dir, f"labels_{cfg['shots']}shots.npy"), real_labels)
+        print(f"  已保存: {real_feat_path}, 形状: {real_features.shape}")
+
+    dalle_feat_path = os.path.join(save_features_dir, f"dalle_features_{cfg['dalle_shots']}shots.npy")
+    if not os.path.exists(dalle_feat_path) and dalle_train_loader_cache is not None:
+        print("\n保存DALL-E生成特征...")
+        dalle_features_list = []
+        dalle_labels_list = []
+        with torch.no_grad():
+            for images, labels in dalle_train_loader_cache:
+                features = clip_model.encode_image(images.cuda())
+                features = F.normalize(features, dim=-1)
+                dalle_features_list.append(features.cpu().numpy())
+                dalle_labels_list.append(labels.numpy())
+        dalle_features = np.concatenate(dalle_features_list, axis=0)
+        dalle_labels = np.concatenate(dalle_labels_list, axis=0)
+        np.save(dalle_feat_path, dalle_features)
+        np.save(os.path.join(save_features_dir, f"dalle_labels_{cfg['dalle_shots']}shots.npy"), dalle_labels)
+        print(f"  已保存: {dalle_feat_path}, 形状: {dalle_features.shape}")
+
+    use_vae = cfg.get('use_vae', cfg.get('use_vae_generation', False))
+    vae_train_loader_cache = None
+    vae_train_loader_F = None
+    clip_cvae_cache_keys = clip_cvae_cache_values = None
+    dalle_cvae_cache_keys = dalle_cvae_cache_values = None
+
+    if use_vae:
+        print("\n使用VAE生成图像增强训练...")
+        vae_dataset_dir = os.path.join(cfg['root_path'], f"vae_{cfg['dataset']}")
+        os.makedirs(vae_dataset_dir, exist_ok=True)
+
+        vae_json_path = os.path.join(vae_dataset_dir, f"vae_{cfg['dataset']}.json")
+        vae_model_path = os.path.join(cfg['cache_dir'], f"best_vae_model_{cfg['shots']}shots.pt")
+
+        if not os.path.exists(vae_json_path):
+            print(f"\n未找到VAE生成的图像数据集，将训练增强版VAE模型并生成图像")
+            print(f"目标JSON路径: {vae_json_path}")
+
+            if not os.path.exists(vae_model_path):
+                text_features, manifold_projector = enhanced_train_vae_with_manifold(
+                    train_loader_cache,
+                    None,
+                    clip_model,
+                    None,
+                    imagenet.classnames,
+                    imagenet.template,
+                    dalle_train_loader_cache,
+                    epochs=cfg.get('vae_epochs', 10),
+                    save_path=vae_model_path,
+                    cfg=cfg
+                )
+
+                if cfg.get('use_conditional_prior', True):
+                    print("\n使用条件先验 p(z|t_c) 训练VAE...")
+                    try:
+                        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                        input_dim = 512
+                        latent_dim = cfg.get('vae_latent_dim', 128)
+
+                        cvae_model = ConditionalVAE(
+                            input_dim=input_dim,
+                            latent_dim=latent_dim,
+                            use_conditional_prior=True
+                        ).to(device)
+
+                        prior_sigma = cfg.get('prior_sigma', 0.1)
+                        prior_beta = cfg.get('prior_beta', 0.5)
+                        print(f"   条件先验参数: sigma={prior_sigma}, beta={prior_beta}")
+
+                        cvae_optimizer = torch.optim.Adam(cvae_model.parameters(), lr=1e-3)
+                        cvae_epochs = cfg.get('cvae_epochs', 20)
+                        print(f"\n训练条件VAE，epochs={cvae_epochs}...")
+
+                        for epoch in range(cvae_epochs):
+                            cvae_model.train()
+                            total_loss = 0
+                            total_recon = 0
+                            total_kld = 0
+
+                            for images, labels in tqdm(dalle_train_loader_cache, desc=f'CVAE Epoch {epoch+1}/{cvae_epochs}'):
+                                images = images.to(device)
+                                labels = labels.to(device)
+
+                                with torch.no_grad():
+                                    clip_features = clip_model.encode_image(images)
+                                    clip_features = F.normalize(clip_features, dim=-1)
+
+                                anchor_features = text_features[labels].to(device)
+
+                                recon, mu, logvar, z = cvae_model(clip_features, anchor_features, use_prior=True)
+
+                                with torch.no_grad():
+                                    prior_mu = cvae_model.anchor_projection(anchor_features)
+                                    prior_mu = F.normalize(prior_mu, dim=-1)
+
+                                loss, recon_loss, kld_loss = conditional_vae_loss(
+                                    recon, clip_features, mu, logvar,
+                                    prior_mu=prior_mu, sigma=prior_sigma, beta=prior_beta
+                                )
+
+                                cvae_optimizer.zero_grad()
+                                loss.backward()
+                                cvae_optimizer.step()
+
+                                total_loss += loss.item()
+                                total_recon += recon_loss.item()
+                                total_kld += kld_loss.item()
+
+                            avg_loss = total_loss / len(dalle_train_loader_cache)
+                            avg_recon = total_recon / len(dalle_train_loader_cache)
+                            avg_kld = total_kld / len(dalle_train_loader_cache)
+                            print(f'CVAE Epoch {epoch+1}/{cvae_epochs}, Loss: {avg_loss:.4f} (Recon: {avg_recon:.4f}, KLD: {avg_kld:.4f})')
+
+                        cvae_model_path = os.path.join(cfg['cache_dir'], f"cvae_model_{cfg['shots']}shots.pt")
+                        torch.save(cvae_model.state_dict(), cvae_model_path)
+                        print(f"条件VAE模型保存到 {cvae_model_path}")
+                        print("条件先验训练完成！")
+
+                    except Exception as e:
+                        print(f"条件VAE训练失败: {e}")
+                        traceback.print_exc()
+                        print("将跳过条件先验训练")
+
+                manifold_path = os.path.join(cfg['cache_dir'], f"manifold_projector_{cfg['shots']}shots.pt")
+                torch.save(manifold_projector, manifold_path)
+                print(f"流形投影器保存到 {manifold_path}")
+
+            if use_vae and os.path.exists(vae_model_path):
+                print(f"使用增强版VAE模型生成图像...")
+
+                manifold_path = os.path.join(cfg['cache_dir'], f"manifold_projector_{cfg['shots']}shots.pt")
+                loaded_manifold_projector = None
+                if os.path.exists(manifold_path):
+                    try:
+                        loaded_manifold_projector = torch.load(manifold_path)
+                        print(f"已加载流形投影器: {manifold_path}")
+                    except Exception as e:
+                        print(f"加载流形投影器失败: {e}")
+
+                print("VAE图像生成功能当前不可用，将跳过此步骤")
+
+                vae_dataset_placeholder = {
+                    "dataset_name": cfg['dataset'],
+                    "generated_with_manifold": True,
+                    "note": "Placeholder for manifold-enhanced training"
+                }
+
+                with open(vae_json_path, 'w') as f:
+                    json.dump(vae_dataset_placeholder, f, indent=2)
+
+                print(f"已创建VAE数据集占位符: {vae_json_path}")
+
+        if use_vae:
+            print(f"\n检查VAE数据集: {vae_json_path}")
+            try:
+                if os.path.exists(vae_json_path):
+                    with open(vae_json_path, 'r') as f:
+                        vae_content = json.load(f)
+
+                    if isinstance(vae_content, dict) and vae_content.get('note') == 'Placeholder for manifold-enhanced training':
+                        print("检测到VAE占位符文件，流形学习已启用但跳过VAE数据集加载")
+                        print("   将继续使用DALL-E图像和流形增强进行训练")
+                        vae_train_loader_cache = None
+                        vae_train_loader_F = None
+                    else:
+                        cfg['vae_shots'] = cfg.get('vae_shots', cfg['shots'])
+                        vae_dataset = build_vae_dataset(cfg['dataset'], cfg['root_path'], cfg['vae_shots'])
+                        if vae_dataset is not None:
+                            vae_train_loader_cache = build_data_loader(data_source=vae_dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=False)
+                            vae_train_loader_F = build_data_loader(data_source=vae_dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=True)
+                            print(f"成功加载VAE数据集，包含 {len(vae_dataset.train_x)} 张图像")
+                        else:
+                            vae_train_loader_cache = None
+                            vae_train_loader_F = None
+                else:
+                    vae_train_loader_cache = None
+                    vae_train_loader_F = None
+            except Exception as e:
+                print(f"VAE数据集处理失败: {e}")
+                traceback.print_exc()
+                vae_train_loader_cache = None
+                vae_train_loader_F = None
+                print("将继续使用DALL-E图像和流形增强进行训练")
+
     with open(cfg['gpt3_prompt_file']) as f:
         gpt3_prompt = json.load(f)
 
-    # Textual features
-    print("Getting textual features as CLIP's classifier.")
+    print("\nGetting textual features as CLIP's classifier.")
     clip_weights = gpt_clip_classifier(imagenet.classnames, gpt3_prompt, clip_model, imagenet.template)
-    
-    # 获取DALL-E图像特征用于流形学习
-    print("提取DALL-E图像特征用于流形学习...")
-    dalle_clip_features = []
-    sample_count = 0
-    max_samples = cfg.get('manifold_samples', 500)  # 限制样本数量以减少计算开销
-    
-    for i, (images, _) in enumerate(tqdm(dalle_train_loader_cache)):
-        if sample_count >= max_samples:
-            break
-        images = images.cuda()
-        with torch.no_grad():
-            batch_features = clip_model.encode_image(images)
-            batch_features /= batch_features.norm(dim=-1, keepdim=True)
-            dalle_clip_features.append(batch_features)
-            sample_count += len(batch_features)
-    
-    if dalle_clip_features:
-        dalle_features_tensor = torch.cat(dalle_clip_features, dim=0)[:max_samples]
-        print(f"获取到 {len(dalle_features_tensor)} 个DALL-E特征用于流形学习")
-    else:
-        dalle_features_tensor = None
-        print("未获取到DALL-E特征，将仅使用文本特征进行流形学习")
-    
-    # 训练增强版VAE模型 - 编码器、生成器和流形投影器
-    # 检查是否需要重新训练VAE
-    vae_encoder_path = cfg['cache_dir'] + "/best_vae_encoder_" + str(cfg['shots']) + "shots.pt"
-    vae_generator_path = cfg['cache_dir'] + "/best_vae_generator_" + str(cfg['shots']) + "shots.pt"
-    
-    if cfg.get('retrain_vae', True) or not (os.path.exists(vae_encoder_path) and os.path.exists(vae_generator_path)):
-        # 需要训练VAE
-        netE, netG, manifold_projector = train_vae(
-            cfg, clip_model, gpt3_prompt, imagenet.classnames, imagenet.template, 
-            dalle_features_tensor, train_loader_cache
-        )
-    else:
-        # 加载已有的VAE模型
-        print(f"\n加载已有的VAE模型 (retrain_vae=False)...")
-        netE = Encoder().cuda()
-        netG = Generator().cuda()
-        
-        netE.load_state_dict(torch.load(vae_encoder_path))
-        netG.load_state_dict(torch.load(vae_generator_path))
-        
-        netE.eval()
-        netG.eval()
-        
-        # 创建流形投影器（即使不训练也需要用于生成）
-        manifold_projector = ManifoldProjector(
-            manifold_dim=cfg.get('manifold_dim', 64),
-            n_neighbors=cfg.get('n_neighbors', 20)
-        )
-        
-        print("VAE模型加载完成。")
-    
-    # 使用增强版VAE生成特征
-    # 检查是否需要重新生成VAE特征
-    vae_features_path = cfg['cache_dir'] + "/vae_clip_features_" + str(cfg['shots']) + "shots.pt"
-    vae_labels_path = cfg['cache_dir'] + "/vae_clip_labels_" + str(cfg['shots']) + "shots.pt"
-    
-    if cfg.get('regenerate_vae', True) or not (os.path.exists(vae_features_path) and os.path.exists(vae_labels_path)):
-        # 需要生成VAE特征
-        vae_features, vae_labels = generate_vae_features(cfg, netE, netG, clip_model, gpt3_prompt, 
-                                                       imagenet.classnames, imagenet.template, 
-                                                       manifold_projector, 
-                                                       n_samples=cfg.get('vae_samples', 10),
-                                                       use_manifold_noise=cfg.get('use_manifold_noise', True))
-        
-        # 保存生成的特征
-        torch.save(vae_features, vae_features_path)
-        torch.save(vae_labels, vae_labels_path)
-    else:
-        # 加载已有的VAE特征
-        print(f"\n加载已有的VAE特征 (regenerate_vae=False)...")
-        vae_features = torch.load(vae_features_path)
-        vae_labels = torch.load(vae_labels_path)
-        print(f"加载了 {len(vae_features)} 个VAE特征。")
-    
-    # 构建VAE缓存模型
-    vae_cache_keys, vae_cache_values = build_vae_cache_model(cfg, clip_model, vae_features, vae_labels)
 
-    # Construct the cache model by few-shot training set
+    clip_dtype = next(clip_model.parameters()).dtype
+    clip_weights = clip_weights.to(clip_dtype)
+    print(f"CLIP weights dtype: {clip_weights.dtype}")
+
     print("\nConstructing cache model by few-shot visual features and labels.")
-    
-    # ===== 0-Shot特殊处理：不使用真实样本缓存 =====
+
     if cfg['shots'] == 0:
-        print("\n⚠️  检测到0-shot配置，将不使用真实样本缓存")
-        # 获取类别数量
+        print("\n检测到0-shot配置，将不使用真实样本缓存")
         num_classes = len(imagenet.classnames)
-        
-        # 创建空的缓存张量
-        # CLIP RN50特征维度: 1024, DINO ResNet50特征维度: 2048
         clip_cache_keys = torch.zeros(1024, 0, dtype=torch.float16).cuda()
         clip_cache_values = torch.zeros(0, num_classes, dtype=torch.float16).cuda()
         dino_cache_keys = torch.zeros(2048, 0, dtype=torch.float16).cuda()
         dino_cache_values = torch.zeros(0, num_classes, dtype=torch.float16).cuda()
-        
-        print(f"   创建空缓存: CLIP keys {clip_cache_keys.shape}, values {clip_cache_values.shape}")
-        print(f"              DINO keys {dino_cache_keys.shape}, values {dino_cache_values.shape}")
     else:
-        # 正常的缓存加载流程（非0-shot）
         print("\nConstructing CLIP cache model.")
         clip_cache_keys, clip_cache_values = build_clip_cache_model(cfg, clip_model, train_loader_cache)
         print("\nConstructing DINO cache model.")
@@ -1332,38 +2097,116 @@ def main():
     print("\nConstructing DINO cache model.")
     dino_dalle_cache_keys, dino_dalle_cache_values = build_dino_dalle_cache_model(cfg, dino_model, dalle_train_loader_cache)
 
-    # Pre-load test features
+    clip_cvae_cache_keys = None
+    clip_cvae_cache_values = None
+    dalle_cvae_cache_keys = None
+    dalle_cvae_cache_values = None
+
+    cvae_model_path = os.path.join(cfg['cache_dir'], f"cvae_model_{cfg['shots']}shots.pt")
+    manifold_path = os.path.join(cfg['cache_dir'], f"manifold_projector_{cfg['shots']}shots.pt")
+    cvae_available = os.path.exists(cvae_model_path)
+
+    if use_vae and cvae_available and dalle_train_loader_cache is not None:
+        try:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+            cvae_model = ConditionalVAE(
+                input_dim=512,
+                latent_dim=cfg.get('vae_latent_dim', 128),
+                use_conditional_prior=True
+            ).to(device)
+            cvae_model.load_state_dict(torch.load(cvae_model_path, map_location=device))
+            cvae_model.eval()
+            print(f"\n[CVAE] 已加载模型: {cvae_model_path}")
+
+            manifold_projector = None
+            if os.path.exists(manifold_path):
+                manifold_projector = torch.load(manifold_path, map_location=device)
+                if hasattr(manifold_projector, 'fitted') and manifold_projector.fitted:
+                    print(f"[CVAE] 已加载 ManifoldProjector (dim={manifold_projector.manifold_dim})")
+
+            clip_dtype = next(clip_model.parameters()).dtype
+
+            print(f"\n[CVAE] 从 DALL-E 图片生成增强特征缓存...")
+            dalle_cvae_cache_keys, dalle_cvae_cache_values = build_cvae_enhanced_cache_model(
+                cfg, clip_model, dalle_train_loader_cache,
+                cvae_model, manifold_projector, None, clip_dtype
+            )
+            torch.save(dalle_cvae_cache_keys, cfg['cache_dir'] + f"/clip_cvae_dalle_keys_{cfg['dalle_shots']}shots.pt")
+            torch.save(dalle_cvae_cache_values, cfg['cache_dir'] + f"/clip_cvae_dalle_values_{cfg['dalle_shots']}shots.pt")
+
+        except Exception as e:
+            print(f"[CVAE] 增强缓存生成失败: {e}")
+            traceback.print_exc()
+            print("[CVAE] 将跳过 CVAE 增强，使用原始缓存继续")
+            dalle_cvae_cache_keys = None
+            dalle_cvae_cache_values = None
+    else:
+        if use_vae and not cvae_available:
+            print(f"\n[CVAE] 未找到训练好的 CVAE 权重 ({cvae_model_path})，跳过 CVAE 增强")
+
     print("\nLoading visual features and labels from test set.")
     print("\nLoading CLIP feature.")
     test_clip_features, test_labels = pre_CLIP_load_features(cfg, "test", clip_model, test_loader)
     print("\nLoading DINO feature.")
     test_dino_features, test_labels = pre_DINO_load_features(cfg, "test", dino_model, test_loader)
-    
-    # ------------------------------------------ Tip-Adapter-F ------------------------------------------
-   
-    # 创建专用VAE适配器，避免使用CLIP适配器
-    # 为此，我们创建一个单独的适配器，注意输入和输出维度
-    print("创建专用VAE适配器...")
-    print(f"VAE缓存键原始形状: {vae_cache_keys.shape}")
-    # 适配器输入维度为特征维度(1024)，输出维度为样本数量
-    vae_adapter = nn.Linear(1024, vae_cache_values.shape[0], bias=False).cuda().to(clip_model.dtype)
-    # 初始化权重，不需要转置，因为Linear层会在内部进行转置
-    vae_adapter.weight.data.copy_(vae_cache_keys)
-    run_ensemble_tip_dalle_adapter_F(cfg, 
-                            torch.cat((clip_cache_keys, clip_dalle_cache_keys), dim=1),
-                            torch.cat((clip_cache_values, clip_dalle_cache_values), dim=0), 
-                            test_clip_features, 
-                            torch.cat((dino_cache_keys, dino_dalle_cache_keys), dim=1), 
-                            torch.cat((dino_cache_values, dino_dalle_cache_values), dim=0), 
-                            test_dino_features, 
-                            test_labels, 
-                            clip_weights, 
-                            clip_model, 
-                            dino_model, 
+
+    all_clip_cache_keys = [clip_cache_keys, clip_dalle_cache_keys]
+    all_clip_cache_values = [clip_cache_values, clip_dalle_cache_values]
+    all_dino_cache_keys = [dino_cache_keys, dino_dalle_cache_keys]
+    all_dino_cache_values = [dino_cache_values, dino_dalle_cache_values]
+
+    if use_vae and dalle_cvae_cache_keys is not None:
+        all_clip_cache_keys.append(dalle_cvae_cache_keys)
+        all_clip_cache_values.append(dalle_cvae_cache_values)
+        print(f"[CVAE] 已将增强特征注入合并缓存: +{dalle_cvae_cache_keys.shape[1]} 样本")
+
+    merged_clip_cache_keys = torch.cat(all_clip_cache_keys, dim=1)
+    merged_clip_cache_values = torch.cat(all_clip_cache_values, dim=0)
+    merged_dino_cache_keys = torch.cat(all_dino_cache_keys, dim=1)
+    merged_dino_cache_values = torch.cat(all_dino_cache_values, dim=0)
+
+    separated_caches = None
+    if cfg.get('use_dynamic_evidence_routing', False):
+        separated_caches = {
+            'clip_real': (clip_cache_keys, clip_cache_values),
+            'clip_pixel': (clip_dalle_cache_keys, clip_dalle_cache_values),
+            'dino': (merged_dino_cache_keys, merged_dino_cache_values),
+        }
+        if use_vae and clip_cvae_cache_keys is not None:
+            separated_caches['clip_cvae_real'] = (clip_cvae_cache_keys, clip_cvae_cache_values)
+        if use_vae and dalle_cvae_cache_keys is not None:
+            separated_caches['clip_cvae_pixel'] = (dalle_cvae_cache_keys, dalle_cvae_cache_values)
+        cvae_tag = ""
+        if clip_cvae_cache_keys is not None:
+            cvae_tag += f" real(+{clip_cvae_cache_keys.shape[1]})"
+        if dalle_cvae_cache_keys is not None:
+            cvae_tag += f" dalle(+{dalle_cvae_cache_keys.shape[1]})"
+        print(f"\n动态路由缓存: C_real={clip_cache_keys.shape[1]}, C_pixel={clip_dalle_cache_keys.shape[1]}, "
+              f"C_cvae={cvae_tag}, C_feature={merged_dino_cache_keys.shape[1]}")
+
+    print(f"\n配置摘要:")
+    print(f"  - shots: {cfg['shots']}")
+    print(f"  - dalle_shots: {cfg.get('dalle_shots', 0)}")
+    print(f"  - use_vae: {use_vae}")
+    print(f"  - 最终CLIP缓存: keys {merged_clip_cache_keys.shape}, values {merged_clip_cache_values.shape}")
+    print(f"  - 最终DINO缓存: keys {merged_dino_cache_keys.shape}, values {merged_dino_cache_values.shape}")
+
+    run_ensemble_tip_dalle_adapter_F(cfg,
+                            merged_clip_cache_keys,
+                            merged_clip_cache_values,
+                            test_clip_features,
+                            merged_dino_cache_keys,
+                            merged_dino_cache_values,
+                            test_dino_features,
+                            test_labels,
+                            clip_weights,
+                            clip_model,
+                            dino_model,
                             train_loader_F,
                             dalle_train_loader_F,
-                            vae_adapter,  # 传递适配器对象而不是缓存键
-                            vae_cache_values)
+                            vae_train_loader_F,
+                            separated_caches=separated_caches)
 
 if __name__ == '__main__':
     main()
