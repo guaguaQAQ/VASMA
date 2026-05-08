@@ -1,8 +1,6 @@
-# Knowledge-Driven Geometric Rectification and Evidential Cache System for Few-Shot Recognition
+# VASMA: Manifold-Guided Geometric Information Fusion for Bridging the Modality Gap
 
-Official implementation of ['Knowledge-Driven Geometric Rectification and Evidential Cache System for Few-Shot Recognition'].
-
-The paper has been submitted to **Knowledge-Based Systems**.
+Official implementation of ['VASMA: Manifold-Guided Geometric Information Fusion for Bridging the Modality Gap'].
 
 ## News
 - The code of VASMA has been released.
